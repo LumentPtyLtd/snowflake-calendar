@@ -75,12 +75,15 @@ CREATE OR REPLACE TABLE CALENDAR_CONFIG (
 
 -- Insert default configuration values
 INSERT INTO CALENDAR_CONFIG (CONFIG_NAME, CONFIG_VALUE, DESCRIPTION)
-VALUES 
-    ('DATE_RANGE', PARSE_JSON('{"start_date": "2015-01-01", "end_date": "2035-12-31"}'), 'Default date range for calendar generation'),
-    ('TIMEZONE', PARSE_JSON('{"timezone": "Australia/Adelaide"}'), 'Default timezone for calendar'),
-    ('TIME_GRAIN', PARSE_JSON('{"grain": "day"}'), 'Default time grain (second, minute, hour, day, week, month, year)'),
-    ('FISCAL_YEAR', PARSE_JSON('{"start_month": 7, "start_day": 1}'), 'Fiscal year start (July 1)'),
-    ('RETAIL_CALENDAR', PARSE_JSON('{"pattern": "445", "start_month": 7, "week_start_day": 1}'), 'Retail calendar pattern (445, 454, 544)');
+SELECT 'DATE_RANGE', PARSE_JSON('{"start_date": "2015-01-01", "end_date": "2035-12-31"}'), 'Default date range for calendar generation'
+UNION ALL
+SELECT 'TIMEZONE', PARSE_JSON('{"timezone": "Australia/Adelaide"}'), 'Default timezone for calendar'
+UNION ALL
+SELECT 'TIME_GRAIN', PARSE_JSON('{"grain": "day"}'), 'Default time grain (second, minute, hour, day, week, month, year)'
+UNION ALL
+SELECT 'FISCAL_YEAR', PARSE_JSON('{"start_month": 7, "start_day": 1}'), 'Fiscal year start (July 1)'
+UNION ALL
+SELECT 'RETAIL_CALENDAR', PARSE_JSON('{"pattern": "445", "start_month": 7, "week_start_day": 1}'), 'Retail calendar pattern (445, 454, 544)';
 
 /*
 ======================================================================================
@@ -88,7 +91,7 @@ STEP 4: CREATE ENHANCED PUBLIC HOLIDAY LOADING PROCEDURE
 ======================================================================================
 */
 
-CREATE OR REPLACE PROCEDURE LOAD_AU_HOLIDAYS(
+CREATE OR REPLACE PROCEDURE SP_LOAD_AU_HOLIDAYS(
     DATABASE_NAME VARCHAR,
     SCHEMA_NAME VARCHAR,
     VALIDATE_ONLY BOOLEAN DEFAULT FALSE
@@ -162,14 +165,14 @@ def fetch_api_data(session, api_url):
             return True, data['result']['records'], None
         else:
             error_msg = "API request was not successful"
-            log_error(session, "LOAD_AU_HOLIDAYS.fetch_api_data", error_msg, "API_ERROR", 
+            log_error(session, "SP_LOAD_AU_HOLIDAYS.fetch_api_data", error_msg, "API_ERROR",
                      {"api_url": api_url, "response": data})
             return False, None, error_msg
 
     except requests.exceptions.RequestException as e:
         error_msg = f"Error fetching data: {str(e)}"
         stack_trace = traceback.format_exc()
-        log_error(session, "LOAD_AU_HOLIDAYS.fetch_api_data", error_msg, "REQUEST_ERROR", 
+        log_error(session, "SP_LOAD_AU_HOLIDAYS.fetch_api_data", error_msg, "REQUEST_ERROR",
                  {"api_url": api_url}, stack_trace)
         return False, None, error_msg
 
@@ -184,7 +187,7 @@ def create_stage(session, stage_name, database_name, schema_name):
     except Exception as e:
         error_msg = f"Error creating stage: {str(e)}"
         stack_trace = traceback.format_exc()
-        log_error(session, "LOAD_AU_HOLIDAYS.create_stage", error_msg, "STAGE_ERROR", 
+        log_error(session, "SP_LOAD_AU_HOLIDAYS.create_stage", error_msg, "STAGE_ERROR",
                  {"stage_name": stage_name, "database_name": database_name, "schema_name": schema_name}, 
                  stack_trace)
         return False, error_msg
@@ -249,7 +252,7 @@ def load_data_to_table(session, df, table_name, database_name, schema_name):
     except Exception as e:
         error_msg = f"Error loading data to table: {str(e)}"
         stack_trace = traceback.format_exc()
-        log_error(session, "LOAD_AU_HOLIDAYS.load_data_to_table", error_msg, "DATA_LOAD_ERROR", 
+        log_error(session, "SP_LOAD_AU_HOLIDAYS.load_data_to_table", error_msg, "DATA_LOAD_ERROR",
                  {"table_name": table_name, "database_name": database_name, "schema_name": schema_name}, 
                  stack_trace)
         return False, error_msg, None
@@ -319,7 +322,7 @@ def main(session, DATABASE_NAME, SCHEMA_NAME, VALIDATE_ONLY=False):
             session.sql(create_view_sql).collect()
             result["details"]["view_created"] = True
         except Exception as e:
-            log_error(session, "LOAD_AU_HOLIDAYS.main", f"Error creating view: {str(e)}", "VIEW_ERROR")
+            log_error(session, "SP_LOAD_AU_HOLIDAYS.main", f"Error creating view: {str(e)}", "VIEW_ERROR")
             result["details"]["view_created"] = False
             result["details"]["view_error"] = str(e)
         
@@ -328,7 +331,7 @@ def main(session, DATABASE_NAME, SCHEMA_NAME, VALIDATE_ONLY=False):
     except Exception as e:
         error_msg = f"Error in main process: {str(e)}"
         stack_trace = traceback.format_exc()
-        log_error(session, "LOAD_AU_HOLIDAYS.main", error_msg, "GENERAL_ERROR", 
+        log_error(session, "SP_LOAD_AU_HOLIDAYS.main", error_msg, "GENERAL_ERROR",
                  {"database_name": DATABASE_NAME, "schema_name": SCHEMA_NAME}, 
                  stack_trace)
         
