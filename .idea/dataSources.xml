@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="DataSourceManagerImpl" format="xml" multifile-model="true">
+    <data-source source="LOCAL" name="SPG_DAP01" track-namespaces="false" single-connection="true" uuid="57b0c0e0-e4d4-4edd-8855-17b3825a203e">
+      <driver-ref>snowflake</driver-ref>
+      <remarks>Star Pharmacy Group - SYSADMIN Role</remarks>
+      <jdbc-driver>net.snowflake.client.jdbc.SnowflakeDriver</jdbc-driver>
+      <jdbc-url>jdbc:snowflake://ag53692.australia-east.azure.snowflakecomputing.com:443?role=SYSADMIN&amp;warehouse=PBI_DEV_XS&amp;db=SPG_DAP01</jdbc-url>
+      <jdbc-additional-properties>
+        <property name="authenticator" value="SNOWFLAKE_JWT" />
+        <property name="auto-refresh-interval" value="360" />
+      </jdbc-additional-properties>
+      <working-dir>$PROJECT_DIR$/..</working-dir>
+      <auto-close enable="true" />
+    </data-source>
+  </component>
+</project>

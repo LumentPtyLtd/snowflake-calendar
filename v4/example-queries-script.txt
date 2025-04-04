@@ -1,0 +1,476 @@
+/*==============================================================================
+  BUSINESS CALENDAR SYSTEM - EXAMPLE QUERIES
+  
+  This script provides example queries that demonstrate how to use the business 
+  calendar system in various reporting and analytics scenarios. These queries can
+  serve as templates for common business use cases.
+  
+  CATEGORIES:
+  ----------
+  - Basic Date Filtering
+  - Time Period Comparisons
+  - Rolling Averages and Trends
+  - Fiscal Year Analysis
+  - Retail Calendar Analysis
+  - Multi-Timezone Support
+  - Custom Period Analysis
+  
+  PREREQUISITES:
+  -------------
+  The calendar system must be set up using the provided generation scripts.
+  
+  AUTHOR: [Your Name]
+  DATE CREATED: 2024-04-04
+  LAST MODIFIED: 2024-04-04
+==============================================================================*/
+
+/*------------------------------------------------------------------------------
+  BASIC DATE FILTERING
+  
+  These examples show how to use dynamic period flags for common date filtering
+  scenarios. The flags automatically update based on the current date.
+------------------------------------------------------------------------------*/
+
+-- Example 1: Current month data
+SELECT 
+    f.TRANSACTION_DATE,
+    SUM(f.AMOUNT) AS TOTAL_AMOUNT
+FROM 
+    FACT_SALES f
+JOIN 
+    DYNAMIC_PERIODS_SIMPLE_DAY d ON f.TRANSACTION_DATE = d.DATE_KEY
+WHERE 
+    d.IS_THIS_MONTH = TRUE
+GROUP BY 
+    f.TRANSACTION_DATE
+ORDER BY 
+    f.TRANSACTION_DATE;
+
+-- Example 2: Last 30 days vs previous 30 days comparison
+WITH last_30_days AS (
+    SELECT 
+        'Last 30 Days' AS PERIOD,
+        SUM(f.AMOUNT) AS TOTAL_AMOUNT
+    FROM 
+        FACT_SALES f
+    JOIN 
+        DYNAMIC_PERIODS_SIMPLE_DAY d ON f.TRANSACTION_DATE = d.DATE_KEY
+    WHERE 
+        d.IS_LAST_30_DAYS = TRUE
+),
+previous_30_days AS (
+    SELECT 
+        'Previous 30 Days' AS PERIOD,
+        SUM(f.AMOUNT) AS TOTAL_AMOUNT
+    FROM 
+        FACT_SALES f
+    JOIN 
+        DYNAMIC_PERIODS_SIMPLE_DAY d ON f.TRANSACTION_DATE = d.DATE_KEY
+    WHERE 
+        d.DAYS_FROM_TODAY BETWEEN -60 AND -31
+)
+SELECT * FROM last_30_days
+UNION ALL
+SELECT * FROM previous_30_days;
+
+/*------------------------------------------------------------------------------
+  TIME PERIOD COMPARISONS
+  
+  These examples demonstrate how to compare data across different time periods,
+  such as year-over-year, month-over-month, etc.
+------------------------------------------------------------------------------*/
+
+-- Example 3: Month-over-month comparison for current year
+SELECT 
+    c.MONTH_NAME AS MONTH,
+    SUM(CASE WHEN d.IS_THIS_YEAR = TRUE THEN f.AMOUNT ELSE 0 END) AS CURRENT_YEAR_AMOUNT,
+    SUM(CASE WHEN d.IS_LAST_YEAR = TRUE THEN f.AMOUNT ELSE 0 END) AS PREVIOUS_YEAR_AMOUNT,
+    (SUM(CASE WHEN d.IS_THIS_YEAR = TRUE THEN f.AMOUNT ELSE 0 END) / 
+     NULLIF(SUM(CASE WHEN d.IS_LAST_YEAR = TRUE THEN f.AMOUNT ELSE 0 END), 0) - 1) * 100 AS YOY_GROWTH_PCT
+FROM 
+    FACT_SALES f
+JOIN 
+    DYNAMIC_PERIODS_SIMPLE_DAY d ON f.TRANSACTION_DATE = d.DATE_KEY
+JOIN 
+    CALENDAR_TABLE_DAY c ON f.TRANSACTION_DATE = c.DATE_KEY
+WHERE 
+    d.IS_THIS_YEAR = TRUE OR d.IS_LAST_YEAR = TRUE
+GROUP BY 
+    c.MONTH, c.MONTH_NAME, c.MONTH_SORT
+ORDER BY 
+    c.MONTH_SORT;
+
+-- Example 4: Quarter-to-date comparison vs previous year
+WITH current_qtd AS (
+    SELECT 
+        'Current QTD' AS PERIOD,
+        SUM(f.AMOUNT) AS TOTAL_AMOUNT
+    FROM 
+        FACT_SALES f
+    JOIN 
+        DYNAMIC_PERIODS_SIMPLE_DAY d ON f.TRANSACTION_DATE = d.DATE_KEY
+    WHERE 
+        d.IS_QTD = TRUE
+),
+previous_year_qtd AS (
+    SELECT 
+        'Previous Year QTD' AS PERIOD,
+        SUM(f.AMOUNT) AS TOTAL_AMOUNT
+    FROM 
+        FACT_SALES f
+    JOIN 
+        UNIFIED_CALENDAR_TABLE_DAY c ON f.TRANSACTION_DATE = c.DATE_KEY
+    WHERE 
+        c.QUARTER = QUARTER(CURRENT_DATE()) 
+        AND c.YEAR = YEAR(CURRENT_DATE()) - 1
+        AND c.DAY_OF_YEAR <= DAYOFYEAR(CURRENT_DATE())
+)
+SELECT 
+    a.PERIOD,
+    a.TOTAL_AMOUNT,
+    b.TOTAL_AMOUNT AS COMPARISON_AMOUNT,
+    (a.TOTAL_AMOUNT / NULLIF(b.TOTAL_AMOUNT, 0) - 1) * 100 AS GROWTH_PCT
+FROM 
+    current_qtd a
+CROSS JOIN 
+    previous_year_qtd b;
+
+/*------------------------------------------------------------------------------
+  ROLLING AVERAGES AND TRENDS
+  
+  These examples show how to calculate rolling averages and analyze trends
+  using the business calendar.
+------------------------------------------------------------------------------*/
+
+-- Example 5: 7-day rolling average for the last 30 days
+SELECT 
+    f.TRANSACTION_DATE,
+    SUM(f.AMOUNT) AS DAILY_AMOUNT,
+    AVG(SUM(f.AMOUNT)) OVER (
+        ORDER BY f.TRANSACTION_DATE
+        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+    ) AS SEVEN_DAY_ROLLING_AVG
+FROM 
+    FACT_SALES f
+JOIN 
+    DYNAMIC_PERIODS_SIMPLE_DAY d ON f.TRANSACTION_DATE = d.DATE_KEY
+WHERE 
+    d.IS_LAST_30_DAYS = TRUE
+GROUP BY 
+    f.TRANSACTION_DATE
+ORDER BY 
+    f.TRANSACTION_DATE;
+
+-- Example 6: Month-to-date running total
+SELECT 
+    f.TRANSACTION_DATE,
+    c.DAY_OF_MONTH,
+    SUM(f.AMOUNT) AS DAILY_AMOUNT,
+    SUM(SUM(f.AMOUNT)) OVER (
+        PARTITION BY c.YEAR, c.MONTH
+        ORDER BY f.TRANSACTION_DATE
+        ROWS UNBOUNDED PRECEDING
+    ) AS MTD_RUNNING_TOTAL
+FROM 
+    FACT_SALES f
+JOIN 
+    DYNAMIC_PERIODS_SIMPLE_DAY d ON f.TRANSACTION_DATE = d.DATE_KEY
+JOIN 
+    CALENDAR_TABLE_DAY c ON f.TRANSACTION_DATE = c.DATE_KEY
+WHERE 
+    d.IS_THIS_MONTH = TRUE
+GROUP BY 
+    f.TRANSACTION_DATE, c.DAY_OF_MONTH
+ORDER BY 
+    f.TRANSACTION_DATE;
+
+/*------------------------------------------------------------------------------
+  FISCAL YEAR ANALYSIS
+  
+  These examples demonstrate how to use the fiscal calendar for financial
+  reporting and analysis.
+------------------------------------------------------------------------------*/
+
+-- Example 7: Fiscal year-to-date vs previous fiscal year comparison
+WITH current_fytd AS (
+    SELECT 
+        'Current FYTD' AS PERIOD,
+        SUM(f.AMOUNT) AS TOTAL_AMOUNT
+    FROM 
+        FACT_SALES f
+    JOIN 
+        UNIFIED_CALENDAR_TABLE_DAY c ON f.TRANSACTION_DATE = c.DATE_KEY
+    WHERE 
+        c.FISCAL_YEAR = YEAR(CURRENT_DATE())
+        AND c.DATE_KEY <= CURRENT_DATE()
+),
+previous_fytd AS (
+    SELECT 
+        'Previous FYTD' AS PERIOD,
+        SUM(f.AMOUNT) AS TOTAL_AMOUNT
+    FROM 
+        FACT_SALES f
+    JOIN 
+        UNIFIED_CALENDAR_TABLE_DAY c1 ON f.TRANSACTION_DATE = c1.DATE_KEY
+    JOIN 
+        UNIFIED_CALENDAR_TABLE_DAY c2 ON c2.DATE_KEY = CURRENT_DATE()
+    WHERE 
+        c1.FISCAL_YEAR = c2.FISCAL_YEAR - 1
+        AND c1.FISCAL_DAY_OF_YEAR <= c2.FISCAL_DAY_OF_YEAR
+)
+SELECT 
+    a.PERIOD,
+    a.TOTAL_AMOUNT,
+    b.TOTAL_AMOUNT AS COMPARISON_AMOUNT,
+    (a.TOTAL_AMOUNT / NULLIF(b.TOTAL_AMOUNT, 0) - 1) * 100 AS GROWTH_PCT
+FROM 
+    current_fytd a
+CROSS JOIN 
+    previous_fytd b;
+
+-- Example 8: Fiscal quarter breakdown by department
+SELECT 
+    c.FISCAL_YEAR,
+    c.FISCAL_QUARTER,
+    c.FISCAL_QUARTER_NAME,
+    f.DEPARTMENT,
+    SUM(f.AMOUNT) AS TOTAL_AMOUNT,
+    SUM(f.AMOUNT) / SUM(SUM(f.AMOUNT)) OVER (
+        PARTITION BY c.FISCAL_YEAR, c.FISCAL_QUARTER
+    ) * 100 AS PERCENT_OF_QUARTER
+FROM 
+    FACT_SALES f
+JOIN 
+    UNIFIED_CALENDAR_TABLE_DAY c ON f.TRANSACTION_DATE = c.DATE_KEY
+WHERE 
+    c.FISCAL_YEAR = YEAR(CURRENT_DATE()) - 1  -- Previous fiscal year
+GROUP BY 
+    c.FISCAL_YEAR, c.FISCAL_QUARTER, c.FISCAL_QUARTER_NAME, f.DEPARTMENT
+ORDER BY 
+    c.FISCAL_YEAR, c.FISCAL_QUARTER, f.DEPARTMENT;
+
+/*------------------------------------------------------------------------------
+  RETAIL CALENDAR ANALYSIS
+  
+  These examples show how to use the retail calendar for retail industry
+  reporting and analysis.
+------------------------------------------------------------------------------*/
+
+-- Example 9: Retail week sales comparison (same week in previous year)
+SELECT 
+    c.RETAIL_YEAR,
+    c.RETAIL_WEEK_OF_YEAR,
+    SUM(f.AMOUNT) AS WEEKLY_SALES,
+    LAG(SUM(f.AMOUNT)) OVER (
+        ORDER BY c.RETAIL_YEAR, c.RETAIL_WEEK_OF_YEAR
+    ) AS PREV_YEAR_WEEKLY_SALES,
+    (SUM(f.AMOUNT) / NULLIF(LAG(SUM(f.AMOUNT)) OVER (
+        ORDER BY c.RETAIL_YEAR, c.RETAIL_WEEK_OF_YEAR
+    ), 0) - 1) * 100 AS YOY_GROWTH_PCT
+FROM 
+    FACT_SALES f
+JOIN 
+    UNIFIED_CALENDAR_TABLE_DAY c ON f.TRANSACTION_DATE = c.DATE_KEY
+WHERE 
+    c.RETAIL_WEEK_OF_YEAR = (
+        SELECT RETAIL_WEEK_OF_YEAR 
+        FROM UNIFIED_CALENDAR_TABLE_DAY 
+        WHERE DATE_KEY = CURRENT_DATE()
+    )
+    AND c.RETAIL_YEAR IN (
+        (SELECT RETAIL_YEAR FROM UNIFIED_CALENDAR_TABLE_DAY WHERE DATE_KEY = CURRENT_DATE()),
+        (SELECT RETAIL_YEAR FROM UNIFIED_CALENDAR_TABLE_DAY WHERE DATE_KEY = CURRENT_DATE()) - 1
+    )
+GROUP BY 
+    c.RETAIL_YEAR, c.RETAIL_WEEK_OF_YEAR
+ORDER BY 
+    c.RETAIL_YEAR, c.RETAIL_WEEK_OF_YEAR;
+
+-- Example 10: Retail month performance for current retail year
+SELECT 
+    c.RETAIL_MONTH_OF_YEAR,
+    CONCAT('M', c.RETAIL_MONTH_OF_YEAR) AS RETAIL_MONTH,
+    SUM(f.AMOUNT) AS MONTHLY_SALES,
+    SUM(SUM(f.AMOUNT)) OVER (
+        ORDER BY c.RETAIL_MONTH_OF_YEAR
+        ROWS UNBOUNDED PRECEDING
+    ) AS CUMULATIVE_SALES
+FROM 
+    FACT_SALES f
+JOIN 
+    UNIFIED_CALENDAR_TABLE_DAY c ON f.TRANSACTION_DATE = c.DATE_KEY
+WHERE 
+    c.RETAIL_YEAR = (
+        SELECT RETAIL_YEAR 
+        FROM UNIFIED_CALENDAR_TABLE_DAY 
+        WHERE DATE_KEY = CURRENT_DATE()
+    )
+GROUP BY 
+    c.RETAIL_MONTH_OF_YEAR
+ORDER BY 
+    c.RETAIL_MONTH_OF_YEAR;
+
+/*------------------------------------------------------------------------------
+  MULTI-TIMEZONE SUPPORT
+  
+  These examples demonstrate how to use the multi-timezone dynamic periods
+  for global reporting and analysis.
+------------------------------------------------------------------------------*/
+
+-- Example 11: Today's sales across different timezones
+SELECT 
+    tz.TIMEZONE_NAME,
+    SUM(f.AMOUNT) AS TODAYS_SALES
+FROM 
+    FACT_SALES f
+JOIN 
+    DYNAMIC_PERIODS_LONDON_NEWY d ON f.TRANSACTION_DATE = d.DATE_KEY
+CROSS JOIN (
+    SELECT 'UTC' AS TIMEZONE_NAME, 'IS_CURRENT_Etc_UTC_TODAY' AS TODAY_FLAG
+    UNION ALL
+    SELECT 'London', 'IS_CURRENT_Europe_London_TODAY'
+    UNION ALL
+    SELECT 'New York', 'IS_CURRENT_America_New_York_TODAY'
+) tz
+WHERE 
+    CASE 
+        WHEN tz.TODAY_FLAG = 'IS_CURRENT_Etc_UTC_TODAY' THEN d.IS_CURRENT_Etc_UTC_TODAY
+        WHEN tz.TODAY_FLAG = 'IS_CURRENT_Europe_London_TODAY' THEN d.IS_CURRENT_Europe_London_TODAY
+        WHEN tz.TODAY_FLAG = 'IS_CURRENT_America_New_York_TODAY' THEN d.IS_CURRENT_America_New_York_TODAY
+    END = TRUE
+GROUP BY 
+    tz.TIMEZONE_NAME
+ORDER BY 
+    tz.TIMEZONE_NAME;
+
+-- Example 12: Current month comparison across different regions
+SELECT 
+    r.REGION_NAME,
+    tz.TIMEZONE_NAME,
+    SUM(f.AMOUNT) AS CURRENT_MONTH_SALES
+FROM 
+    FACT_SALES f
+JOIN 
+    DIM_REGION r ON f.REGION_ID = r.REGION_ID
+JOIN 
+    DYNAMIC_PERIODS_LONDON_NEWY d ON f.TRANSACTION_DATE = d.DATE_KEY
+CROSS JOIN (
+    SELECT 'Europe' AS REGION_GROUP, 'Europe/London' AS TIMEZONE_NAME, 'IS_CURRENT_Europe_London_THIS_MONTH' AS MONTH_FLAG
+    UNION ALL
+    SELECT 'Americas', 'America/New_York', 'IS_CURRENT_America_New_York_THIS_MONTH'
+    UNION ALL
+    SELECT 'Global', 'Etc/UTC', 'IS_CURRENT_Etc_UTC_THIS_MONTH'
+) tz
+WHERE 
+    (r.REGION_GROUP = tz.REGION_GROUP OR tz.REGION_GROUP = 'Global')
+    AND CASE 
+        WHEN tz.MONTH_FLAG = 'IS_CURRENT_Etc_UTC_THIS_MONTH' THEN d.IS_CURRENT_Etc_UTC_THIS_MONTH
+        WHEN tz.MONTH_FLAG = 'IS_CURRENT_Europe_London_THIS_MONTH' THEN d.IS_CURRENT_Europe_London_THIS_MONTH
+        WHEN tz.MONTH_FLAG = 'IS_CURRENT_America_New_York_THIS_MONTH' THEN d.IS_CURRENT_America_New_York_THIS_MONTH
+    END = TRUE
+GROUP BY 
+    r.REGION_NAME, tz.TIMEZONE_NAME
+ORDER BY 
+    r.REGION_NAME, tz.TIMEZONE_NAME;
+
+/*------------------------------------------------------------------------------
+  CUSTOM PERIOD ANALYSIS
+  
+  These examples demonstrate how to create custom periods and comparisons
+  using the business calendar system.
+------------------------------------------------------------------------------*/
+
+-- Example 13: Custom business period comparison
+WITH current_period AS (
+    SELECT 
+        'Current Period' AS PERIOD_NAME,
+        '2023-03-15' AS START_DATE,
+        '2023-04-15' AS END_DATE
+),
+comparison_period AS (
+    SELECT 
+        'Comparison Period' AS PERIOD_NAME,
+        DATEADD(year, -1, '2023-03-15') AS START_DATE,
+        DATEADD(year, -1, '2023-04-15') AS END_DATE
+),
+period_sales AS (
+    SELECT 
+        p.PERIOD_NAME,
+        SUM(f.AMOUNT) AS TOTAL_SALES,
+        COUNT(DISTINCT f.TRANSACTION_DATE) AS DAYS_WITH_SALES
+    FROM 
+        FACT_SALES f
+    JOIN 
+        CALENDAR_TABLE_DAY c ON f.TRANSACTION_DATE = c.DATE_KEY
+    JOIN (
+        SELECT PERIOD_NAME, START_DATE, END_DATE FROM current_period
+        UNION ALL
+        SELECT PERIOD_NAME, START_DATE, END_DATE FROM comparison_period
+    ) p ON f.TRANSACTION_DATE BETWEEN p.START_DATE AND p.END_DATE
+    GROUP BY 
+        p.PERIOD_NAME
+)
+SELECT 
+    a.PERIOD_NAME,
+    a.TOTAL_SALES,
+    a.DAYS_WITH_SALES,
+    a.TOTAL_SALES / a.DAYS_WITH_SALES AS DAILY_AVG_SALES,
+    b.TOTAL_SALES AS COMPARISON_SALES,
+    b.DAYS_WITH_SALES AS COMPARISON_DAYS,
+    b.TOTAL_SALES / b.DAYS_WITH_SALES AS COMPARISON_DAILY_AVG,
+    (a.TOTAL_SALES / a.DAYS_WITH_SALES) / 
+    (b.TOTAL_SALES / b.DAYS_WITH_SALES) - 1 AS DAILY_AVG_GROWTH
+FROM 
+    period_sales a
+JOIN 
+    period_sales b ON a.PERIOD_NAME = 'Current Period' AND b.PERIOD_NAME = 'Comparison Period';
+
+-- Example 14: Rolling 4-week periods for the past 12 weeks
+WITH date_range AS (
+    SELECT 
+        DATEADD(week, -11, DATE_TRUNC('week', CURRENT_DATE())) AS START_DATE,
+        DATEADD(day, -1, DATE_TRUNC('week', CURRENT_DATE())) AS END_DATE
+),
+week_dates AS (
+    SELECT 
+        DATE_TRUNC('week', d.DATE_KEY) AS WEEK_START_DATE,
+        DATEADD(day, 6, DATE_TRUNC('week', d.DATE_KEY)) AS WEEK_END_DATE,
+        DENSE_RANK() OVER (ORDER BY DATE_TRUNC('week', d.DATE_KEY)) AS WEEK_NUM
+    FROM 
+        CALENDAR_TABLE_DAY d,
+        date_range r
+    WHERE 
+        d.DATE_KEY BETWEEN r.START_DATE AND r.END_DATE
+    GROUP BY 
+        DATE_TRUNC('week', d.DATE_KEY)
+),
+rolling_periods AS (
+    SELECT 
+        a.WEEK_NUM AS PERIOD_END_WEEK,
+        CONCAT('Weeks ', a.WEEK_NUM - 3, '-', a.WEEK_NUM) AS PERIOD_NAME,
+        b.WEEK_START_DATE AS PERIOD_START_DATE,
+        a.WEEK_END_DATE AS PERIOD_END_DATE
+    FROM 
+        week_dates a
+    JOIN 
+        week_dates b ON a.WEEK_NUM BETWEEN b.WEEK_NUM AND b.WEEK_NUM + 3
+    WHERE 
+        a.WEEK_NUM > 3
+    GROUP BY 
+        a.WEEK_NUM, a.WEEK_END_DATE, b.WEEK_START_DATE
+)
+SELECT 
+    p.PERIOD_NAME,
+    p.PERIOD_START_DATE,
+    p.PERIOD_END_DATE,
+    SUM(f.AMOUNT) AS TOTAL_SALES,
+    COUNT(DISTINCT f.TRANSACTION_DATE) AS DAYS_WITH_SALES,
+    SUM(f.AMOUNT) / COUNT(DISTINCT f.TRANSACTION_DATE) AS DAILY_AVG_SALES
+FROM 
+    rolling_periods p
+JOIN 
+    FACT_SALES f ON f.TRANSACTION_DATE BETWEEN p.PERIOD_START_DATE AND p.PERIOD_END_DATE
+GROUP BY 
+    p.PERIOD_NAME, p.PERIOD_START_DATE, p.PERIOD_END_DATE, p.PERIOD_END_WEEK
+ORDER BY 
+    p.PERIOD_END_WEEK;
