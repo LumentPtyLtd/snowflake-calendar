@@ -1,0 +1,253 @@
+/*==============================================================================
+  DYNAMIC PERIODS GENERATOR (Refactored with UDF + IS_NOW, Param Removed)
+
+  Creates a dynamic periods view using UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS
+  for date-based flags and adds the timestamp-based IS_NOW flag directly.
+  The number of relative period flags (+/- N) is fixed within the UDF.
+
+  USAGE:
+  ------
+  -- Ensure UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS exists first
+  CALL GENERATE_SIMPLE_DYNAMIC_PERIODS(
+      'UNIFIED_CALENDAR_TABLE_DAY',  -- Base calendar table/view name (must have DATE_KEY and DATE_TIME)
+      'DAY'                          -- Time grain (affects IS_NOW calc and view name)
+  );
+
+  PARAMETERS:
+  -----------
+  BASE_CALENDAR_NAME: Name of the underlying calendar table/view (must contain DATE_KEY and DATE_TIME)
+  TIME_GRAIN: Granularity level (SECOND, MINUTE, HOUR, DAY)
+
+  RETURNS: String indicating success or failure.
+  NOTES: Uses CURRENT_DATE() and CURRENT_TIMESTAMP() for calculations. Relies on UDF.
+
+  AUTHOR: Andrew Exley, Lument Pty Ltd
+  DATE CREATED: 2025-04-04
+  LAST MODIFIED: 2025-04-05 (Refactored)
+==============================================================================*/
+CREATE OR REPLACE PROCEDURE GENERATE_DYNAMIC_PERIODS(
+    BASE_CALENDAR_NAME VARCHAR,
+    TIME_GRAIN VARCHAR(10)
+)
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+AS
+$$
+    // ----- Input Validation -----
+    const validTimeGrains = ['SECOND', 'MINUTE', 'HOUR', 'DAY'];
+    const grainUpper = TIME_GRAIN.toUpperCase();
+    if (validTimeGrains.indexOf(grainUpper) === -1) {
+        return `ERROR: Dynamic Periods generation currently supports grains: ${validTimeGrains.join(', ')}. Grain provided: ${TIME_GRAIN}`;
+    }
+    if (!BASE_CALENDAR_NAME || BASE_CALENDAR_NAME.trim() === '') {
+        return "ERROR: BASE_CALENDAR_NAME must be provided.";
+    }
+    // Removed validation and assignment for RELATIVE_PERIODS_COUNT_ARG
+
+    // ----- Dynamic Name Construction -----
+    const dynamicViewName = `DYNAMIC_PERIODS_SIMPLE_${grainUpper}`;
+    const finalViewName = dynamicViewName;
+
+    // ----- SQL Construction -----
+    let createViewSql = '';
+    let currentStep = 'Starting';
+
+    try {
+        currentStep = 'Constructing CREATE VIEW statement using UDF and IS_NOW';
+
+        // Define the SELECT list extracting flags from the UDF result
+        const udfSelectList = `
+            -- Flags from UDF (Date-based)
+            flags.value:IS_TODAY::BOOLEAN AS IS_TODAY,
+            flags.value:IS_YESTERDAY::BOOLEAN AS IS_YESTERDAY,
+            flags.value:IS_TOMORROW::BOOLEAN AS IS_TOMORROW,
+            flags.value:IS_THIS_WEEK::BOOLEAN AS IS_THIS_WEEK,
+            flags.value:IS_LAST_WEEK::BOOLEAN AS IS_LAST_WEEK,
+            flags.value:IS_NEXT_WEEK::BOOLEAN AS IS_NEXT_WEEK,
+            flags.value:IS_THIS_MONTH::BOOLEAN AS IS_THIS_MONTH,
+            flags.value:IS_LAST_MONTH::BOOLEAN AS IS_LAST_MONTH,
+            flags.value:IS_NEXT_MONTH::BOOLEAN AS IS_NEXT_MONTH,
+            flags.value:IS_THIS_QUARTER::BOOLEAN AS IS_THIS_QUARTER,
+            flags.value:IS_LAST_QUARTER::BOOLEAN AS IS_LAST_QUARTER,
+            flags.value:IS_NEXT_QUARTER::BOOLEAN AS IS_NEXT_QUARTER,
+            flags.value:IS_THIS_YEAR::BOOLEAN AS IS_THIS_YEAR,
+            flags.value:IS_LAST_YEAR::BOOLEAN AS IS_LAST_YEAR,
+            flags.value:IS_NEXT_YEAR::BOOLEAN AS IS_NEXT_YEAR,
+            flags.value:IS_YTD::BOOLEAN AS IS_YTD,
+            flags.value:IS_QTD::BOOLEAN AS IS_QTD,
+            flags.value:IS_MTD::BOOLEAN AS IS_MTD,
+            flags.value:IS_WTD::BOOLEAN AS IS_WTD,
+            flags.value:IS_LAST_7_DAYS::BOOLEAN AS IS_LAST_7_DAYS,
+            flags.value:IS_LAST_30_DAYS::BOOLEAN AS IS_LAST_30_DAYS,
+            flags.value:IS_LAST_90_DAYS::BOOLEAN AS IS_LAST_90_DAYS,
+            flags.value:IS_LAST_365_DAYS::BOOLEAN AS IS_LAST_365_DAYS,
+            flags.value:DAYS_FROM_TODAY::INTEGER AS DAYS_FROM_TODAY,
+            flags.value:WEEKS_FROM_THIS_WEEK::INTEGER AS WEEKS_FROM_THIS_WEEK,
+            flags.value:MONTHS_FROM_THIS_MONTH::INTEGER AS MONTHS_FROM_THIS_MONTH,
+            flags.value:QUARTERS_FROM_THIS_QUARTER::INTEGER AS QUARTERS_FROM_THIS_QUARTER,
+            flags.value:YEARS_FROM_THIS_YEAR::INTEGER AS YEARS_FROM_THIS_YEAR,
+
+            -- Relative period flags (extracting the fixed set from UDF)
+            flags.value:IS_WEEK_MINUS_1::BOOLEAN AS IS_WEEK_MINUS_1,
+            flags.value:IS_WEEK_MINUS_2::BOOLEAN AS IS_WEEK_MINUS_2,
+            flags.value:IS_WEEK_MINUS_3::BOOLEAN AS IS_WEEK_MINUS_3,
+            flags.value:IS_WEEK_MINUS_4::BOOLEAN AS IS_WEEK_MINUS_4,
+            flags.value:IS_WEEK_MINUS_5::BOOLEAN AS IS_WEEK_MINUS_5,
+            flags.value:IS_WEEK_MINUS_6::BOOLEAN AS IS_WEEK_MINUS_6,
+            flags.value:IS_WEEK_MINUS_7::BOOLEAN AS IS_WEEK_MINUS_7,
+            flags.value:IS_WEEK_MINUS_8::BOOLEAN AS IS_WEEK_MINUS_8,
+            flags.value:IS_WEEK_MINUS_9::BOOLEAN AS IS_WEEK_MINUS_9,
+            flags.value:IS_WEEK_MINUS_10::BOOLEAN AS IS_WEEK_MINUS_10,
+            flags.value:IS_WEEK_MINUS_11::BOOLEAN AS IS_WEEK_MINUS_11,
+            flags.value:IS_WEEK_MINUS_12::BOOLEAN AS IS_WEEK_MINUS_12,
+            flags.value:IS_MONTH_MINUS_1::BOOLEAN AS IS_MONTH_MINUS_1,
+            flags.value:IS_MONTH_MINUS_2::BOOLEAN AS IS_MONTH_MINUS_2,
+            flags.value:IS_MONTH_MINUS_3::BOOLEAN AS IS_MONTH_MINUS_3,
+            flags.value:IS_MONTH_MINUS_4::BOOLEAN AS IS_MONTH_MINUS_4,
+            flags.value:IS_MONTH_MINUS_5::BOOLEAN AS IS_MONTH_MINUS_5,
+            flags.value:IS_MONTH_MINUS_6::BOOLEAN AS IS_MONTH_MINUS_6,
+            flags.value:IS_MONTH_MINUS_7::BOOLEAN AS IS_MONTH_MINUS_7,
+            flags.value:IS_MONTH_MINUS_8::BOOLEAN AS IS_MONTH_MINUS_8,
+            flags.value:IS_MONTH_MINUS_9::BOOLEAN AS IS_MONTH_MINUS_9,
+            flags.value:IS_MONTH_MINUS_10::BOOLEAN AS IS_MONTH_MINUS_10,
+            flags.value:IS_MONTH_MINUS_11::BOOLEAN AS IS_MONTH_MINUS_11,
+            flags.value:IS_MONTH_MINUS_12::BOOLEAN AS IS_MONTH_MINUS_12,
+            flags.value:IS_QUARTER_MINUS_1::BOOLEAN AS IS_QUARTER_MINUS_1,
+            flags.value:IS_QUARTER_MINUS_2::BOOLEAN AS IS_QUARTER_MINUS_2,
+            flags.value:IS_QUARTER_MINUS_3::BOOLEAN AS IS_QUARTER_MINUS_3,
+            flags.value:IS_QUARTER_MINUS_4::BOOLEAN AS IS_QUARTER_MINUS_4,
+            flags.value:IS_QUARTER_MINUS_5::BOOLEAN AS IS_QUARTER_MINUS_5,
+            flags.value:IS_QUARTER_MINUS_6::BOOLEAN AS IS_QUARTER_MINUS_6,
+            flags.value:IS_QUARTER_MINUS_7::BOOLEAN AS IS_QUARTER_MINUS_7,
+            flags.value:IS_QUARTER_MINUS_8::BOOLEAN AS IS_QUARTER_MINUS_8,
+            flags.value:IS_QUARTER_MINUS_9::BOOLEAN AS IS_QUARTER_MINUS_9,
+            flags.value:IS_QUARTER_MINUS_10::BOOLEAN AS IS_QUARTER_MINUS_10,
+            flags.value:IS_QUARTER_MINUS_11::BOOLEAN AS IS_QUARTER_MINUS_11,
+            flags.value:IS_QUARTER_MINUS_12::BOOLEAN AS IS_QUARTER_MINUS_12,
+            flags.value:IS_YEAR_MINUS_1::BOOLEAN AS IS_YEAR_MINUS_1,
+            flags.value:IS_YEAR_MINUS_2::BOOLEAN AS IS_YEAR_MINUS_2,
+            flags.value:IS_YEAR_MINUS_3::BOOLEAN AS IS_YEAR_MINUS_3,
+            flags.value:IS_YEAR_MINUS_4::BOOLEAN AS IS_YEAR_MINUS_4,
+            flags.value:IS_YEAR_MINUS_5::BOOLEAN AS IS_YEAR_MINUS_5,
+            flags.value:IS_YEAR_MINUS_6::BOOLEAN AS IS_YEAR_MINUS_6,
+            flags.value:IS_YEAR_MINUS_7::BOOLEAN AS IS_YEAR_MINUS_7,
+            flags.value:IS_YEAR_MINUS_8::BOOLEAN AS IS_YEAR_MINUS_8,
+            flags.value:IS_YEAR_MINUS_9::BOOLEAN AS IS_YEAR_MINUS_9,
+            flags.value:IS_YEAR_MINUS_10::BOOLEAN AS IS_YEAR_MINUS_10,
+            flags.value:IS_YEAR_MINUS_11::BOOLEAN AS IS_YEAR_MINUS_11,
+            flags.value:IS_YEAR_MINUS_12::BOOLEAN AS IS_YEAR_MINUS_12,
+            flags.value:IS_WEEK_PLUS_1::BOOLEAN AS IS_WEEK_PLUS_1,
+            flags.value:IS_WEEK_PLUS_2::BOOLEAN AS IS_WEEK_PLUS_2,
+            flags.value:IS_WEEK_PLUS_3::BOOLEAN AS IS_WEEK_PLUS_3,
+            flags.value:IS_WEEK_PLUS_4::BOOLEAN AS IS_WEEK_PLUS_4,
+            flags.value:IS_MONTH_PLUS_1::BOOLEAN AS IS_MONTH_PLUS_1,
+            flags.value:IS_MONTH_PLUS_2::BOOLEAN AS IS_MONTH_PLUS_2,
+            flags.value:IS_MONTH_PLUS_3::BOOLEAN AS IS_MONTH_PLUS_3,
+            flags.value:IS_MONTH_PLUS_4::BOOLEAN AS IS_MONTH_PLUS_4,
+            flags.value:IS_QUARTER_PLUS_1::BOOLEAN AS IS_QUARTER_PLUS_1,
+            flags.value:IS_QUARTER_PLUS_2::BOOLEAN AS IS_QUARTER_PLUS_2,
+            flags.value:IS_QUARTER_PLUS_3::BOOLEAN AS IS_QUARTER_PLUS_3,
+            flags.value:IS_QUARTER_PLUS_4::BOOLEAN AS IS_QUARTER_PLUS_4,
+            flags.value:IS_YEAR_PLUS_1::BOOLEAN AS IS_YEAR_PLUS_1,
+            flags.value:IS_YEAR_PLUS_2::BOOLEAN AS IS_YEAR_PLUS_2,
+            flags.value:IS_YEAR_PLUS_3::BOOLEAN AS IS_YEAR_PLUS_3,
+            flags.value:IS_YEAR_PLUS_4::BOOLEAN AS IS_YEAR_PLUS_4
+        `;
+
+        // Period descriptions (referencing the new flag columns)
+        const periodDescriptions = `
+            -- Period descriptions (for display purposes)
+            CASE
+                WHEN IS_TODAY THEN 'Today'
+                WHEN IS_YESTERDAY THEN 'Yesterday'
+                WHEN IS_TOMORROW THEN 'Tomorrow'
+                WHEN IS_THIS_WEEK THEN 'This Week'
+                WHEN IS_LAST_WEEK THEN 'Last Week'
+                WHEN IS_NEXT_WEEK THEN 'Next Week'
+                WHEN IS_THIS_MONTH THEN 'This Month'
+                WHEN IS_LAST_MONTH THEN 'Last Month'
+                WHEN IS_NEXT_MONTH THEN 'Next Month'
+                WHEN IS_THIS_QUARTER THEN 'This Quarter'
+                WHEN IS_LAST_QUARTER THEN 'Last Quarter'
+                WHEN IS_NEXT_QUARTER THEN 'Next Quarter'
+                WHEN IS_THIS_YEAR THEN 'This Year'
+                WHEN IS_LAST_YEAR THEN 'Last Year'
+                WHEN IS_NEXT_YEAR THEN 'Next Year'
+                WHEN IS_YTD THEN 'Year to Date'
+                WHEN IS_QTD THEN 'Quarter to Date'
+                WHEN IS_MTD THEN 'Month to Date'
+                WHEN IS_WTD THEN 'Week to Date'
+                WHEN IS_LAST_7_DAYS THEN 'Last 7 Days'
+                WHEN IS_LAST_30_DAYS THEN 'Last 30 Days'
+                WHEN IS_LAST_90_DAYS THEN 'Last 90 Days'
+                WHEN IS_LAST_365_DAYS THEN 'Last 365 Days'
+                ELSE 'Other Period'
+            END AS CURRENT_PERIOD_DESCRIPTION,
+
+            -- Dynamic month/quarter/year offset descriptions
+            CASE
+                WHEN MONTHS_FROM_THIS_MONTH = 0 THEN 'Current Month'
+                WHEN MONTHS_FROM_THIS_MONTH = -1 THEN 'Previous Month'
+                WHEN MONTHS_FROM_THIS_MONTH = 1 THEN 'Next Month'
+                WHEN MONTHS_FROM_THIS_MONTH < 0 THEN ABS(MONTHS_FROM_THIS_MONTH) || ' Months Ago'
+                ELSE MONTHS_FROM_THIS_MONTH || ' Months From Now'
+            END AS RELATIVE_MONTH_DESCRIPTION,
+
+            CASE
+                WHEN QUARTERS_FROM_THIS_QUARTER = 0 THEN 'Current Quarter'
+                WHEN QUARTERS_FROM_THIS_QUARTER = -1 THEN 'Previous Quarter'
+                WHEN QUARTERS_FROM_THIS_QUARTER = 1 THEN 'Next Quarter'
+                WHEN QUARTERS_FROM_THIS_QUARTER < 0 THEN ABS(QUARTERS_FROM_THIS_QUARTER) || ' Quarters Ago'
+                ELSE QUARTERS_FROM_THIS_QUARTER || ' Quarters From Now'
+            END AS RELATIVE_QUARTER_DESCRIPTION,
+
+            CASE
+                WHEN YEARS_FROM_THIS_YEAR = 0 THEN 'Current Year'
+                WHEN YEARS_FROM_THIS_YEAR = -1 THEN 'Previous Year'
+                WHEN YEARS_FROM_THIS_YEAR = 1 THEN 'Next Year'
+                WHEN YEARS_FROM_THIS_YEAR < 0 THEN ABS(YEARS_FROM_THIS_YEAR) || ' Years Ago'
+                ELSE YEARS_FROM_THIS_YEAR || ' Years From Now'
+            END AS RELATIVE_YEAR_DESCRIPTION
+        `;
+
+        // ----- View Creation -----
+        const viewComment = `Dynamic time periods view based on ${grainUpper} grain. Uses UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS with CURRENT_DATE() for date calculations and includes IS_NOW flag based on CURRENT_TIMESTAMP(). Provides automatically updating time-relative flags.`;
+
+        createViewSql = `
+            CREATE OR REPLACE VIEW ${finalViewName}
+            COMMENT = '${viewComment.replace(/'/g, "''")}'
+            AS
+            SELECT
+                c.*,
+                -- IS_NOW flag (Timestamp-based)
+                (c.DATE_TIME = DATE_TRUNC('${grainUpper}', CURRENT_TIMESTAMP())) AS IS_NOW,
+                -- Date-based flags from UDF
+                ${udfSelectList},
+                -- Descriptions
+                ${periodDescriptions}
+            FROM ${BASE_CALENDAR_NAME} c,
+            LATERAL (SELECT UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS(c.DATE_KEY, CURRENT_DATE()) AS value) flags
+        `;
+
+        currentStep = `Executing CREATE VIEW statement for ${finalViewName}`;
+        snowflake.createStatement({ sqlText: createViewSql }).execute();
+
+        return `Dynamic Periods view '${finalViewName}' generated successfully based on '${BASE_CALENDAR_NAME}' using UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS and including IS_NOW flag. Access the view with SELECT * FROM ${finalViewName}.`;
+
+    } catch (err) {
+        // Check if error is due to missing UDF
+        if (err.message.includes("Unknown user-defined function")) {
+             return `ERROR creating view ${finalViewName}: UDF 'UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS' not found. Please ensure the UDF is created before running this procedure. Original error: ${err.code} - ${err.message}`;
+        }
+         // Check if error is due to missing DATE_TIME or DATE_KEY in base table
+        if (err.message.includes("invalid identifier")) {
+             if (err.message.toUpperCase().includes("'DATE_TIME'")) {
+                 return `ERROR creating view ${finalViewName}: Base calendar '${BASE_CALENDAR_NAME}' does not contain the required 'DATE_TIME' column for the IS_NOW calculation. Original error: ${err.code} - ${err.message}`;
+             }
+             if (err.message.toUpperCase().includes("'DATE_KEY'")) {
+                 return `ERROR creating view ${finalViewName}: Base calendar '${BASE_CALENDAR_NAME}' does not contain the required 'DATE_KEY' column for the UDF call. Original error: ${err.code} - ${err.message}`;
+             }
+        }
+        return `ERROR during Dynamic Periods generation (Step: ${currentStep}): ${err.code} - ${err.message}\nAttempted SQL (if applicable):\n${createViewSql}`;
+    }
+$$;

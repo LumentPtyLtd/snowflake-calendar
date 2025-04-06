@@ -1,0 +1,424 @@
+/*==============================================================================
+  BUSINESS CALENDAR SYSTEM - MASTER ORCHESTRATION SCRIPT
+
+  Coordinates the execution of all calendar component modules.
+  Set all variables here for each calendar requriement.
+  Uses a generic procedure for view materialisation.
+
+  AUTHOR: Andrew Exley, Lument Pty Ltd
+  DATE CREATED: 2025-04-04
+  LAST MODIFIED: 2025-04-04
+==============================================================================*/
+
+-- Set configuration variables
+SET CALENDAR_START_DATE = '2020-01-01';
+SET CALENDAR_END_DATE = '2030-12-31';
+SET TIME_GRAIN = 'DAY';
+SET INCLUDE_FISCAL = TRUE;
+SET FISCAL_YEAR_START_MONTH = 7;
+SET INCLUDE_RETAIL = TRUE;
+SET RETAIL_PATTERN = '4-4-5';
+SET RETAIL_YEAR_END_MONTH = 1;
+SET INCLUDE_DYNAMIC_PERIODS = TRUE;
+SET INCLUDE_MULTI_TIMEZONE = FALSE;
+SET TIMEZONE_LIST = ARRAY_CONSTRUCT('Etc/UTC', 'Australia/South', 'Australia/Queensland', 'Australia/NSW', 'Australia/Victoria', 'Australia/West');
+
+-- Warehouse to use for calendar generation
+SET CALENDAR_WAREHOUSE = 'COMPUTE_WH';
+USE WAREHOUSE IDENTIFIER($CALENDAR_WAREHOUSE);
+
+-- =============================================================================
+-- GENERIC PROCEDURE TO MATERIALISE A VIEW INTO A TABLE
+-- =============================================================================
+CREATE OR REPLACE PROCEDURE MATERIALISE_VIEW_GENERIC(
+    SOURCE_VIEW_NAME VARCHAR,
+    TARGET_TABLE_NAME VARCHAR,
+    CLUSTERING_KEY VARCHAR,
+    TABLE_COMMENT VARCHAR -- Optional comment for the table
+)
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+AS
+$$
+    try {
+        // --- Input Validation ---
+        if (!SOURCE_VIEW_NAME || SOURCE_VIEW_NAME.trim() === '') {
+            return "ERROR: SOURCE_VIEW_NAME must be provided.";
+        }
+        if (!TARGET_TABLE_NAME || TARGET_TABLE_NAME.trim() === '') {
+            return "ERROR: TARGET_TABLE_NAME must be provided.";
+        }
+        if (!CLUSTERING_KEY || CLUSTERING_KEY.trim() === '') {
+            return "ERROR: CLUSTERING_KEY must be provided.";
+        }
+
+        // --- Step 0: Check if source view exists ---
+        try {
+             snowflake.execute({ sqlText: `DESC VIEW IDENTIFIER(?)`, binds: [SOURCE_VIEW_NAME] });
+        } catch (descErr) {
+             if (descErr.message.includes("does not exist or not authorized")) {
+                 return `ERROR: Source view '${SOURCE_VIEW_NAME}' does not exist or is not authorized. Cannot materialize.`;
+             }
+             throw descErr;
+        }
+
+        // --- Step 1: Create table from view ---
+        const createSql = `
+            CREATE OR REPLACE TABLE IDENTIFIER(?) AS
+            SELECT * FROM IDENTIFIER(?);
+        `;
+        snowflake.execute({ sqlText: createSql, binds: [TARGET_TABLE_NAME, SOURCE_VIEW_NAME] });
+
+        // --- Step 2: Add clustering key ---
+        const clusterSql = `
+            ALTER TABLE IDENTIFIER(?) CLUSTER BY (IDENTIFIER(?));
+        `;
+        snowflake.execute({ sqlText: clusterSql, binds: [TARGET_TABLE_NAME, CLUSTERING_KEY] });
+
+        // --- Step 3: Add comment (if provided) ---
+        if (TABLE_COMMENT && TABLE_COMMENT.trim().length > 0) {
+            const commentSql = `
+                COMMENT ON TABLE IDENTIFIER(?) IS ?;
+            `;
+            snowflake.execute({ sqlText: commentSql, binds: [TARGET_TABLE_NAME, TABLE_COMMENT] });
+        }
+
+        // --- Success ---
+        return `View '${SOURCE_VIEW_NAME}' materialized successfully as '${TARGET_TABLE_NAME}' clustered by '${CLUSTERING_KEY}'.`;
+
+    } catch (err) {
+        // --- Error Handling ---
+        return `ERROR materializing view '${SOURCE_VIEW_NAME}' to table '${TARGET_TABLE_NAME}': ${err.code} - ${err.message}`;
+    }
+$$;
+
+
+-- Create orchestration stored procedure
+CREATE OR REPLACE PROCEDURE GENERATE_BUSINESS_CALENDAR(
+    START_DATE DATE,
+    END_DATE DATE,
+    TIME_GRAIN VARCHAR(10),
+    INCLUDE_FISCAL BOOLEAN DEFAULT TRUE,
+    FISCAL_YEAR_START_MONTH FLOAT DEFAULT 7.0,
+    INCLUDE_RETAIL BOOLEAN DEFAULT TRUE,
+    RETAIL_PATTERN VARCHAR(5) DEFAULT '4-5-4',
+    RETAIL_YEAR_END_MONTH FLOAT DEFAULT 1.0,
+    INCLUDE_DYNAMIC_PERIODS BOOLEAN DEFAULT TRUE,
+    INCLUDE_MULTI_TIMEZONE BOOLEAN DEFAULT FALSE,
+    TIMEZONE_LIST ARRAY DEFAULT ARRAY_CONSTRUCT('Etc/UTC')
+)
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+AS
+$$
+    // Validate inputs
+    const validTimeGrains = ['SECOND', 'MINUTE', 'HOUR', 'DAY', 'MONTH', 'YEAR'];
+    const grainUpper = TIME_GRAIN.toUpperCase();
+    if (validTimeGrains.indexOf(grainUpper) === -1) {
+        return `ERROR: Invalid time grain. Must be one of: ${validTimeGrains.join(', ')}`;
+    }
+
+    // Initialize execution log
+    let executionLog = [];
+    const log = (step, result) => {
+        if (typeof result === 'string' && result.toUpperCase().startsWith('ERROR')) {
+             executionLog.push(`${step}: FAILED - ${result}`);
+        } else {
+            executionLog.push(`${step}: ${result}`);
+        }
+        return result;
+    };
+
+    // Helper function to execute a procedure call and log the result
+    function executeAndLog(step, sql) {
+        try {
+            let stmt = snowflake.createStatement({ sqlText: sql });
+            let res = stmt.execute();
+            res.next();
+            return log(step, res.getColumnValue(1));
+        } catch (err) {
+            const errorMsg = `ERROR executing step '${step}': ${err.code} - ${err.message}`;
+            log(step, errorMsg);
+            throw new Error(errorMsg); // Stop execution on error
+        }
+    }
+
+    try {
+        // Ensure UDF exists before generating dynamic periods
+        if (INCLUDE_DYNAMIC_PERIODS) {
+             try {
+                 snowflake.execute({ sqlText: `SELECT UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS(CURRENT_DATE(), CURRENT_DATE());` });
+             } catch (udfErr) {
+                 if (udfErr.message.includes("Unknown user-defined function")) {
+                     return `ERROR: Prerequisite UDF 'UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS' not found. Please create it before running GENERATE_BUSINESS_CALENDAR.`;
+                 }
+                 throw udfErr;
+             }
+        }
+
+        // STEP 1: Generate date spine table
+        executeAndLog('STEP 1 - Generate date spine',
+            `CALL GENERATE_DATE_SPINE(
+                TO_TIMESTAMP_NTZ('${START_DATE}'),
+                TO_TIMESTAMP_NTZ('${END_DATE}'),
+                '${grainUpper}')`
+        );
+
+        // STEP 2: Generate standard calendar view
+        executeAndLog('STEP 2 - Generate standard calendar view',
+            `CALL GENERATE_CALENDAR('${grainUpper}')`
+        );
+
+        // STEP 3: Materialise standard calendar view using generic procedure
+        const stdCalendarView = `CALENDAR_${grainUpper}`;
+        const stdCalendarTable = `CALENDAR_TABLE_${grainUpper}`;
+        const stdComment = `Materialised standard calendar table at ${grainUpper} grain. Contains comprehensive date and time attributes.`;
+        executeAndLog('STEP 3 - Materialise standard calendar',
+            `CALL MATERIALISE_VIEW_GENERIC(
+                '${stdCalendarView}',
+                '${stdCalendarTable}',
+                'DATE_KEY', -- Cluster key
+                '${stdComment.replace(/'/g, "''")}')` // Escape comment
+        );
+
+        // STEP 4: Generate and Materialise fiscal calendar if requested
+        if (INCLUDE_FISCAL) {
+            executeAndLog('STEP 4a - Generate fiscal calendar view',
+                `CALL GENERATE_FISCAL_CALENDAR('${grainUpper}', ${FISCAL_YEAR_START_MONTH})`
+            );
+
+            const fiscalView = `FISCAL_CALENDAR_${grainUpper}`;
+            const fiscalTable = `FISCAL_CALENDAR_TABLE_${grainUpper}`;
+            const fiscalComment = `Materialised fiscal calendar table at ${grainUpper} grain. Fiscal Year starts month ${Math.trunc(FISCAL_YEAR_START_MONTH)}.`;
+            executeAndLog('STEP 4b - Materialise fiscal calendar',
+                `CALL MATERIALISE_VIEW_GENERIC(
+                    '${fiscalView}',
+                    '${fiscalTable}',
+                    'DATE_KEY',
+                    '${fiscalComment.replace(/'/g, "''")}')` // Escape comment
+            );
+        } else {
+            log('STEP 4 - Fiscal Calendar', 'Skipped (not requested)');
+        }
+
+        // STEP 5: Generate and Materialize retail calendar if requested
+        let retailPatternSuffix = ''; // Needed later for unified calendar name
+        if (INCLUDE_RETAIL) {
+            retailPatternSuffix = RETAIL_PATTERN.replace(/-/g, '');
+            executeAndLog('STEP 5a - Generate retail calendar view',
+                `CALL GENERATE_RETAIL_CALENDAR(
+                    '${grainUpper}',
+                    '${RETAIL_PATTERN}',
+                    ${RETAIL_YEAR_END_MONTH})`
+            );
+
+            const retailView = `RETAIL_CALENDAR_${retailPatternSuffix}_${grainUpper}`;
+            const retailTable = `RETAIL_CALENDAR_TABLE_${retailPatternSuffix}_${grainUpper}`;
+            const retailComment = `Materialised retail calendar table (${RETAIL_PATTERN} pattern) at ${grainUpper} grain. Retail year ends approx month ${Math.trunc(RETAIL_YEAR_END_MONTH)}.`;
+            executeAndLog('STEP 5b - Materialise retail calendar',
+                `CALL MATERIALISE_VIEW_GENERIC(
+                    '${retailView}',
+                    '${retailTable}',
+                    'DATE_KEY',
+                    '${retailComment.replace(/'/g, "''")}')` // Escape comment
+            );
+        } else {
+            log('STEP 5 - Retail Calendar', 'Skipped (not requested)');
+        }
+
+        // STEP 6: Generate unified calendar view
+        executeAndLog('STEP 6 - Generate unified calendar view',
+            `CALL GENERATE_UNIFIED_CALENDAR(
+                '${grainUpper}',
+                ${INCLUDE_FISCAL},
+                ${INCLUDE_FISCAL ? FISCAL_YEAR_START_MONTH : 'NULL'},
+                ${INCLUDE_RETAIL},
+                ${INCLUDE_RETAIL ? "'" + RETAIL_PATTERN + "'" : 'NULL'},
+                ${INCLUDE_RETAIL ? RETAIL_YEAR_END_MONTH : 'NULL'})`
+        );
+
+        // STEP 7: Materialise unified calendar view
+        // Reconstruct the source unified view name (must match the name generated in step 6)
+        let unifiedViewName = `UNIFIED_CALENDAR_${grainUpper}`;
+        if (INCLUDE_FISCAL) {
+            unifiedViewName += `_FY${Math.trunc(FISCAL_YEAR_START_MONTH)}`;
+        }
+        if (INCLUDE_RETAIL) {
+            const patternSuffix = RETAIL_PATTERN.replace(/-/g, '');
+            unifiedViewName += `_R${patternSuffix}_END${Math.trunc(RETAIL_YEAR_END_MONTH)}`;
+        }
+        const unifiedTargetTable = `UNIFIED_CALENDAR_TABLE_${grainUpper}`;
+        const unifiedComment = `Materialized unified calendar table at ${grainUpper} grain. Combines standard${INCLUDE_FISCAL ? ', fiscal' : ''}${INCLUDE_RETAIL ? ', retail' : ''} calendars.`;
+
+        executeAndLog('STEP 7 - Materialise unified calendar',
+             `CALL MATERIALISE_VIEW_GENERIC(
+                 '${unifiedViewName}',
+                 '${unifiedTargetTable}',
+                 'DATE_KEY',
+                 '${unifiedComment.replace(/'/g, "''")}')` // Escape comment
+        );
+
+        // STEP 8: Generate dynamic periods view if requested
+        if (INCLUDE_DYNAMIC_PERIODS) {
+            const baseDynamicCalendar = unifiedTargetTable; // Base on the materialized unified table
+
+            if (INCLUDE_MULTI_TIMEZONE) {
+                executeAndLog('STEP 8 - Generate dynamic periods view',
+                    `CALL GENERATE_DYNAMIC_PERIODS(
+                        '${grainUpper}',
+                        PARSE_JSON('${JSON.stringify(TIMEZONE_LIST)}')
+                        )`
+                );
+            } else {
+                executeAndLog('STEP 8 - Generate dynamic multiple time zone periods view',
+                    `CALL GENERATE_DYNAMIC_PERIODS_MTZ(
+                        '${baseDynamicCalendar}',
+                        '${grainUpper}'
+                        )`
+                );
+            }
+        } else {
+            log('STEP 8 - Generate dynamic periods view', 'Skipped (not requested)');
+        }
+
+        // STEP 9: Generate calendar data dictionary view
+        executeAndLog('STEP 9 - Generate calendar data dictionary view',
+            `CALL GENERATE_CALENDAR_DATA_DICTIONARY()`
+        );
+
+        // Summarize and return results
+        const calendarObjects = [
+            `DATE_SPINE_${grainUpper} (Table)`,
+            stdCalendarView + ' (View)',
+            stdCalendarTable + ' (Table)'
+        ];
+        if (INCLUDE_FISCAL) {
+            calendarObjects.push(`FISCAL_CALENDAR_${grainUpper} (View)`);
+            calendarObjects.push(`FISCAL_CALENDAR_TABLE_${grainUpper} (Table)`);
+        }
+        if (INCLUDE_RETAIL) {
+            const patternSuffix = RETAIL_PATTERN.replace(/-/g, '');
+            calendarObjects.push(`RETAIL_CALENDAR_${patternSuffix}_${grainUpper} (View)`);
+            calendarObjects.push(`RETAIL_CALENDAR_TABLE_${patternSuffix}_${grainUpper} (Table)`);
+        }
+        calendarObjects.push(unifiedViewName + ' (View)'); // Show actual unified view name
+        calendarObjects.push(unifiedTargetTable + ' (Table)');
+
+        if (INCLUDE_DYNAMIC_PERIODS) {
+            let dynamicViewName = `DYNAMIC_PERIODS_`;
+             if (!INCLUDE_MULTI_TIMEZONE) {
+                 dynamicViewName += `SIMPLE_`;
+             }
+             dynamicViewName += `${grainUpper}`;
+             if (INCLUDE_MULTI_TIMEZONE) {
+                 if (TIMEZONE_LIST.length === 1 && TIMEZONE_LIST[0] === 'Etc/UTC') { /* no suffix */ }
+                 else if (TIMEZONE_LIST.length <= 3) {
+                     const tzCodes = TIMEZONE_LIST.map(tz => tz.split('/').pop().substring(0, 4).toUpperCase());
+                     dynamicViewName += `_${tzCodes.join('_')}`;
+                 } else {
+                     dynamicViewName += `_${TIMEZONE_LIST.length}TZ`;
+                 }
+             }
+             calendarObjects.push(`${dynamicViewName} (View)`);
+        }
+        calendarObjects.push(`CALENDAR_DATA_DICTIONARY (View)`);
+
+        const errors = executionLog.filter(logMsg => logMsg.toUpperCase().includes(': FAILED -'));
+        if (errors.length > 0) {
+             return `
+Business calendar system generation finished with ERRORS!
+
+EXECUTION LOG:
+${executionLog.join('\n')}
+
+Please review the errors above. Some objects may not have been created or are incomplete.
+             `;
+        }
+
+        return `
+Business calendar system generated successfully!
+
+EXECUTION LOG:
+${executionLog.join('\n')}
+
+KEY OBJECTS CREATED/UPDATED:
+${calendarObjects.join('\n')}
+
+USAGE EXAMPLES:
+- For reporting: SELECT * FROM ${unifiedTargetTable} WHERE FISCAL_YEAR = 2024;
+- For dynamic date filters: SELECT * FROM ${INCLUDE_DYNAMIC_PERIODS ? (INCLUDE_MULTI_TIMEZONE ? `DYNAMIC_PERIODS_${grainUpper}...` : `DYNAMIC_PERIODS_SIMPLE_${grainUpper}`) : 'DYNAMIC_PERIODS_VIEW_NAME'} WHERE IS_THIS_MONTH = TRUE; -- Adjust view name as needed
+- To find column definitions: SELECT * FROM CALENDAR_DATA_DICTIONARY WHERE table_name LIKE '%${grainUpper}%' ORDER BY table_name, ordinal_position;
+
+For detailed usage examples, see documentation or example query file.
+        `;
+    } catch (err) {
+        return `ERROR during business calendar orchestration: ${err.code} - ${err.message}\n\nExecution log before error:\n${executionLog.join('\n')}`;
+    }
+$$;
+
+-- Create procedure to generate data dictionary
+CREATE OR REPLACE PROCEDURE GENERATE_CALENDAR_DATA_DICTIONARY()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    -- Create view to document all calendar system objects
+    CREATE OR REPLACE VIEW CALENDAR_DATA_DICTIONARY AS
+    SELECT
+        c.table_catalog,
+        c.table_schema,
+        c.table_name,
+        t.table_type, -- Added table type (VIEW or BASE TABLE)
+        c.column_name,
+        c.ordinal_position,
+        c.data_type,
+        c.character_maximum_length,
+        c.numeric_precision,
+        c.numeric_scale,
+        c.is_nullable,
+        c.column_default,
+        c.comment AS column_comment,
+        t.comment AS table_comment -- Added table comment
+    FROM
+        information_schema.columns c
+    JOIN
+        information_schema.tables t ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+    WHERE
+        (c.table_name ILIKE 'DATE_SPINE_%'
+        OR c.table_name ILIKE 'CALENDAR_%'
+        OR c.table_name ILIKE 'FISCAL_CALENDAR_%'
+        OR c.table_name ILIKE 'RETAIL_CALENDAR_%'
+        OR c.table_name ILIKE 'UNIFIED_CALENDAR_%'
+        OR c.table_name ILIKE 'DYNAMIC_PERIODS_%')
+        AND c.table_schema = CURRENT_SCHEMA() -- Limit to current schema
+    ORDER BY
+        c.table_name,
+        c.ordinal_position;
+
+    RETURN 'Calendar data dictionary view (CALENDAR_DATA_DICTIONARY) created/updated successfully.';
+END;
+$$;
+
+-- REMOVE THE OLD SPECIFIC MATERIALISATION PROCEDURES:
+-- DROP PROCEDURE IF EXISTS MATERIALISE_CALENDAR_TABLE(VARCHAR);
+-- DROP PROCEDURE IF EXISTS MATERIALISE_FISCAL_CALENDAR_TABLE(VARCHAR);
+-- DROP PROCEDURE IF EXISTS MATERIALISE_RETAIL_CALENDAR_TABLE(VARCHAR, VARCHAR);
+-- DROP PROCEDURE IF EXISTS MATERIALISE_UNIFIED_CALENDAR_TABLE(VARCHAR);
+-- (Optional: Add DROP commands if you want to ensure they are removed cleanly)
+
+
+-- Execute the calendar generation
+CALL GENERATE_BUSINESS_CALENDAR(
+    $CALENDAR_START_DATE,
+    $CALENDAR_END_DATE,
+    $TIME_GRAIN,
+    $INCLUDE_FISCAL,
+    $FISCAL_YEAR_START_MONTH,
+    $INCLUDE_RETAIL,
+    $RETAIL_PATTERN,
+    $RETAIL_YEAR_END_MONTH,
+    $INCLUDE_DYNAMIC_PERIODS,
+    $INCLUDE_MULTI_TIMEZONE,
+    $TIMEZONE_LIST
+);

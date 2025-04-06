@@ -1,0 +1,187 @@
+/*==============================================================================
+  DYNAMIC PERIOD FLAGS CALCULATION UDF
+
+  This User-Defined Function (UDF) calculates a comprehensive set of dynamic,
+  time-relative period flags and distance metrics for a given calendar date
+  compared against a reference date (e.g., the current date in a specific timezone).
+  It serves as the core reusable logic for the dynamic period views.
+
+  The resulting OBJECT includes flags for:
+  - Basic periods (Today, Yesterday, Tomorrow)
+  - Relative standard periods (This/Last/Next Week, Month, Quarter, Year)
+  - Cumulative periods (WTD, MTD, QTD, YTD)
+  - Rolling periods (Last 7/30/90/365 Days)
+  - Relative distance calculations (Days/Weeks/Months/Quarters/Years From Reference)
+  - Fixed set of past/future relative period flags (e.g., IS_MONTH_MINUS_1, IS_WEEK_PLUS_2)
+
+  USAGE: (Example within a SELECT statement)
+  ------
+  SELECT
+      c.DATE_KEY,
+      flags.value:IS_THIS_MONTH::BOOLEAN AS IS_THIS_MONTH,
+      flags.value:DAYS_FROM_TODAY::INTEGER AS DAYS_FROM_TODAY
+  FROM
+      MY_CALENDAR_TABLE c,
+      LATERAL (SELECT UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS(c.DATE_KEY, CURRENT_DATE()) AS value) flags
+  WHERE
+      c.DATE_KEY BETWEEN '2023-01-01' AND '2023-12-31';
+
+  PARAMETERS:
+  -----------
+  P_CALENDAR_DATE DATE: The specific date from the calendar table/view to evaluate.
+  P_REFERENCE_DATE DATE: The reference date (e.g., CURRENT_DATE() in a target timezone)
+                         against which the calendar date is compared.
+
+  RETURNS:
+  --------
+  OBJECT: A Snowflake OBJECT containing key-value pairs where keys are flag/metric
+          names (e.g., 'IS_TODAY', 'DAYS_FROM_TODAY') and values are the
+          calculated results (Boolean or Integer).
+
+  PREREQUISITES:
+  -------------
+  None, beyond standard SQL date functions.
+
+  NOTES:
+  ------
+  - This UDF focuses on DATE-level comparisons. For time-sensitive flags like
+    'IS_NOW', timestamp inputs would be required.
+  - The number of relative past/future period flags (e.g., IS_MONTH_MINUS_N)
+    is fixed within the UDF definition (currently 12 past, 4 future).
+  - Designed to be called from views like DYNAMIC_PERIODS_SIMPLE_* and
+    DYNAMIC_PERIODS_* to centralize logic and reduce code duplication.
+
+  AUTHOR: Andrew Exley, Lument Pty Ltd
+  DATE CREATED: 2025-04-05
+  LAST MODIFIED: 2025-04-05
+==============================================================================*/
+
+CREATE OR REPLACE FUNCTION UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS(
+    p_calendar_date DATE,
+    p_reference_date DATE
+)
+RETURNS OBJECT
+LANGUAGE SQL
+AS
+$$
+OBJECT_CONSTRUCT(
+    -- Basic period flags (relative to p_reference_date)
+    'IS_TODAY', (p_calendar_date = p_reference_date),
+    'IS_YESTERDAY', (p_calendar_date = DATEADD(day, -1, p_reference_date)),
+    'IS_TOMORROW', (p_calendar_date = DATEADD(day, 1, p_reference_date)),
+
+    -- Week periods
+    'IS_THIS_WEEK', (p_calendar_date BETWEEN DATE_TRUNC('week', p_reference_date) AND LAST_DAY(p_reference_date, 'week')),
+    'IS_LAST_WEEK', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -1, p_reference_date)) AND LAST_DAY(DATEADD(week, -1, p_reference_date), 'week')),
+    'IS_NEXT_WEEK', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, 1, p_reference_date)) AND LAST_DAY(DATEADD(week, 1, p_reference_date), 'week')),
+
+    -- Month periods
+    'IS_THIS_MONTH', (p_calendar_date BETWEEN DATE_TRUNC('month', p_reference_date) AND LAST_DAY(p_reference_date, 'month')),
+    'IS_LAST_MONTH', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -1, p_reference_date)) AND LAST_DAY(DATEADD(month, -1, p_reference_date), 'month')),
+    'IS_NEXT_MONTH', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, 1, p_reference_date)) AND LAST_DAY(DATEADD(month, 1, p_reference_date), 'month')),
+
+    -- Quarter periods
+    'IS_THIS_QUARTER', (p_calendar_date BETWEEN DATE_TRUNC('quarter', p_reference_date) AND LAST_DAY(p_reference_date, 'quarter')),
+    'IS_LAST_QUARTER', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -1, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -1, p_reference_date), 'quarter')),
+    'IS_NEXT_QUARTER', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, 1, p_reference_date)) AND LAST_DAY(DATEADD(quarter, 1, p_reference_date), 'quarter')),
+
+    -- Year periods
+    'IS_THIS_YEAR', (p_calendar_date BETWEEN DATE_TRUNC('year', p_reference_date) AND LAST_DAY(p_reference_date, 'year')),
+    'IS_LAST_YEAR', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -1, p_reference_date)) AND LAST_DAY(DATEADD(year, -1, p_reference_date), 'year')),
+    'IS_NEXT_YEAR', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, 1, p_reference_date)) AND LAST_DAY(DATEADD(year, 1, p_reference_date), 'year')),
+
+    -- Year-to-date, Quarter-to-date, Month-to-date, Week-to-date
+    'IS_YTD', (p_calendar_date BETWEEN DATE_TRUNC('year', p_reference_date) AND p_reference_date),
+    'IS_QTD', (p_calendar_date BETWEEN DATE_TRUNC('quarter', p_reference_date) AND p_reference_date),
+    'IS_MTD', (p_calendar_date BETWEEN DATE_TRUNC('month', p_reference_date) AND p_reference_date),
+    'IS_WTD', (p_calendar_date BETWEEN DATE_TRUNC('week', p_reference_date) AND p_reference_date),
+
+    -- Rolling periods
+    'IS_LAST_7_DAYS', (p_calendar_date BETWEEN DATEADD(day, -6, p_reference_date) AND p_reference_date),
+    'IS_LAST_30_DAYS', (p_calendar_date BETWEEN DATEADD(day, -29, p_reference_date) AND p_reference_date),
+    'IS_LAST_90_DAYS', (p_calendar_date BETWEEN DATEADD(day, -89, p_reference_date) AND p_reference_date),
+    'IS_LAST_365_DAYS', (p_calendar_date BETWEEN DATEADD(day, -364, p_reference_date) AND p_reference_date),
+
+    -- Relative distance calculations
+    'DAYS_FROM_TODAY', DATEDIFF('day', p_reference_date, p_calendar_date),
+    'WEEKS_FROM_THIS_WEEK', DATEDIFF('week', DATE_TRUNC('week', p_reference_date), DATE_TRUNC('week', p_calendar_date)),
+    'MONTHS_FROM_THIS_MONTH', DATEDIFF('month', DATE_TRUNC('month', p_reference_date), DATE_TRUNC('month', p_calendar_date)),
+    'QUARTERS_FROM_THIS_QUARTER', DATEDIFF('quarter', DATE_TRUNC('quarter', p_reference_date), DATE_TRUNC('quarter', p_calendar_date)),
+    'YEARS_FROM_THIS_YEAR', DATEDIFF('year', DATE_TRUNC('year', p_reference_date), DATE_TRUNC('year', p_calendar_date)),
+
+    -- Relative period flags (Fixed number: 12 past, 4 future for simplicity in SQL UDF)
+    -- Past Weeks
+    'IS_WEEK_MINUS_1', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -1, p_reference_date)) AND LAST_DAY(DATEADD(week, -1, p_reference_date), 'week')),
+    'IS_WEEK_MINUS_2', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -2, p_reference_date)) AND LAST_DAY(DATEADD(week, -2, p_reference_date), 'week')),
+    'IS_WEEK_MINUS_3', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -3, p_reference_date)) AND LAST_DAY(DATEADD(week, -3, p_reference_date), 'week')),
+    'IS_WEEK_MINUS_4', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -4, p_reference_date)) AND LAST_DAY(DATEADD(week, -4, p_reference_date), 'week')),
+    'IS_WEEK_MINUS_5', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -5, p_reference_date)) AND LAST_DAY(DATEADD(week, -5, p_reference_date), 'week')),
+    'IS_WEEK_MINUS_6', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -6, p_reference_date)) AND LAST_DAY(DATEADD(week, -6, p_reference_date), 'week')),
+    'IS_WEEK_MINUS_7', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -7, p_reference_date)) AND LAST_DAY(DATEADD(week, -7, p_reference_date), 'week')),
+    'IS_WEEK_MINUS_8', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -8, p_reference_date)) AND LAST_DAY(DATEADD(week, -8, p_reference_date), 'week')),
+    'IS_WEEK_MINUS_9', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -9, p_reference_date)) AND LAST_DAY(DATEADD(week, -9, p_reference_date), 'week')),
+    'IS_WEEK_MINUS_10', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -10, p_reference_date)) AND LAST_DAY(DATEADD(week, -10, p_reference_date), 'week')),
+    'IS_WEEK_MINUS_11', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -11, p_reference_date)) AND LAST_DAY(DATEADD(week, -11, p_reference_date), 'week')),
+    'IS_WEEK_MINUS_12', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, -12, p_reference_date)) AND LAST_DAY(DATEADD(week, -12, p_reference_date), 'week')),
+    -- Past Months
+    'IS_MONTH_MINUS_1', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -1, p_reference_date)) AND LAST_DAY(DATEADD(month, -1, p_reference_date), 'month')),
+    'IS_MONTH_MINUS_2', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -2, p_reference_date)) AND LAST_DAY(DATEADD(month, -2, p_reference_date), 'month')),
+    'IS_MONTH_MINUS_3', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -3, p_reference_date)) AND LAST_DAY(DATEADD(month, -3, p_reference_date), 'month')),
+    'IS_MONTH_MINUS_4', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -4, p_reference_date)) AND LAST_DAY(DATEADD(month, -4, p_reference_date), 'month')),
+    'IS_MONTH_MINUS_5', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -5, p_reference_date)) AND LAST_DAY(DATEADD(month, -5, p_reference_date), 'month')),
+    'IS_MONTH_MINUS_6', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -6, p_reference_date)) AND LAST_DAY(DATEADD(month, -6, p_reference_date), 'month')),
+    'IS_MONTH_MINUS_7', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -7, p_reference_date)) AND LAST_DAY(DATEADD(month, -7, p_reference_date), 'month')),
+    'IS_MONTH_MINUS_8', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -8, p_reference_date)) AND LAST_DAY(DATEADD(month, -8, p_reference_date), 'month')),
+    'IS_MONTH_MINUS_9', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -9, p_reference_date)) AND LAST_DAY(DATEADD(month, -9, p_reference_date), 'month')),
+    'IS_MONTH_MINUS_10', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -10, p_reference_date)) AND LAST_DAY(DATEADD(month, -10, p_reference_date), 'month')),
+    'IS_MONTH_MINUS_11', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -11, p_reference_date)) AND LAST_DAY(DATEADD(month, -11, p_reference_date), 'month')),
+    'IS_MONTH_MINUS_12', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, -12, p_reference_date)) AND LAST_DAY(DATEADD(month, -12, p_reference_date), 'month')),
+    -- Past Quarters
+    'IS_QUARTER_MINUS_1', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -1, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -1, p_reference_date), 'quarter')),
+    'IS_QUARTER_MINUS_2', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -2, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -2, p_reference_date), 'quarter')),
+    'IS_QUARTER_MINUS_3', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -3, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -3, p_reference_date), 'quarter')),
+    'IS_QUARTER_MINUS_4', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -4, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -4, p_reference_date), 'quarter')),
+    'IS_QUARTER_MINUS_5', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -5, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -5, p_reference_date), 'quarter')),
+    'IS_QUARTER_MINUS_6', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -6, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -6, p_reference_date), 'quarter')),
+    'IS_QUARTER_MINUS_7', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -7, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -7, p_reference_date), 'quarter')),
+    'IS_QUARTER_MINUS_8', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -8, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -8, p_reference_date), 'quarter')),
+    'IS_QUARTER_MINUS_9', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -9, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -9, p_reference_date), 'quarter')),
+    'IS_QUARTER_MINUS_10', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -10, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -10, p_reference_date), 'quarter')),
+    'IS_QUARTER_MINUS_11', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -11, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -11, p_reference_date), 'quarter')),
+    'IS_QUARTER_MINUS_12', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, -12, p_reference_date)) AND LAST_DAY(DATEADD(quarter, -12, p_reference_date), 'quarter')),
+    -- Past Years
+    'IS_YEAR_MINUS_1', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -1, p_reference_date)) AND LAST_DAY(DATEADD(year, -1, p_reference_date), 'year')),
+    'IS_YEAR_MINUS_2', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -2, p_reference_date)) AND LAST_DAY(DATEADD(year, -2, p_reference_date), 'year')),
+    'IS_YEAR_MINUS_3', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -3, p_reference_date)) AND LAST_DAY(DATEADD(year, -3, p_reference_date), 'year')),
+    'IS_YEAR_MINUS_4', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -4, p_reference_date)) AND LAST_DAY(DATEADD(year, -4, p_reference_date), 'year')),
+    'IS_YEAR_MINUS_5', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -5, p_reference_date)) AND LAST_DAY(DATEADD(year, -5, p_reference_date), 'year')),
+    'IS_YEAR_MINUS_6', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -6, p_reference_date)) AND LAST_DAY(DATEADD(year, -6, p_reference_date), 'year')),
+    'IS_YEAR_MINUS_7', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -7, p_reference_date)) AND LAST_DAY(DATEADD(year, -7, p_reference_date), 'year')),
+    'IS_YEAR_MINUS_8', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -8, p_reference_date)) AND LAST_DAY(DATEADD(year, -8, p_reference_date), 'year')),
+    'IS_YEAR_MINUS_9', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -9, p_reference_date)) AND LAST_DAY(DATEADD(year, -9, p_reference_date), 'year')),
+    'IS_YEAR_MINUS_10', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -10, p_reference_date)) AND LAST_DAY(DATEADD(year, -10, p_reference_date), 'year')),
+    'IS_YEAR_MINUS_11', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -11, p_reference_date)) AND LAST_DAY(DATEADD(year, -11, p_reference_date), 'year')),
+    'IS_YEAR_MINUS_12', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, -12, p_reference_date)) AND LAST_DAY(DATEADD(year, -12, p_reference_date), 'year')),
+
+    -- Future Weeks
+    'IS_WEEK_PLUS_1', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, 1, p_reference_date)) AND LAST_DAY(DATEADD(week, 1, p_reference_date), 'week')),
+    'IS_WEEK_PLUS_2', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, 2, p_reference_date)) AND LAST_DAY(DATEADD(week, 2, p_reference_date), 'week')),
+    'IS_WEEK_PLUS_3', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, 3, p_reference_date)) AND LAST_DAY(DATEADD(week, 3, p_reference_date), 'week')),
+    'IS_WEEK_PLUS_4', (p_calendar_date BETWEEN DATE_TRUNC('week', DATEADD(week, 4, p_reference_date)) AND LAST_DAY(DATEADD(week, 4, p_reference_date), 'week')),
+    -- Future Months
+    'IS_MONTH_PLUS_1', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, 1, p_reference_date)) AND LAST_DAY(DATEADD(month, 1, p_reference_date), 'month')),
+    'IS_MONTH_PLUS_2', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, 2, p_reference_date)) AND LAST_DAY(DATEADD(month, 2, p_reference_date), 'month')),
+    'IS_MONTH_PLUS_3', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, 3, p_reference_date)) AND LAST_DAY(DATEADD(month, 3, p_reference_date), 'month')),
+    'IS_MONTH_PLUS_4', (p_calendar_date BETWEEN DATE_TRUNC('month', DATEADD(month, 4, p_reference_date)) AND LAST_DAY(DATEADD(month, 4, p_reference_date), 'month')),
+    -- Future Quarters
+    'IS_QUARTER_PLUS_1', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, 1, p_reference_date)) AND LAST_DAY(DATEADD(quarter, 1, p_reference_date), 'quarter')),
+    'IS_QUARTER_PLUS_2', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, 2, p_reference_date)) AND LAST_DAY(DATEADD(quarter, 2, p_reference_date), 'quarter')),
+    'IS_QUARTER_PLUS_3', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, 3, p_reference_date)) AND LAST_DAY(DATEADD(quarter, 3, p_reference_date), 'quarter')),
+    'IS_QUARTER_PLUS_4', (p_calendar_date BETWEEN DATE_TRUNC('quarter', DATEADD(quarter, 4, p_reference_date)) AND LAST_DAY(DATEADD(quarter, 4, p_reference_date), 'quarter')),
+    -- Future Years
+    'IS_YEAR_PLUS_1', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, 1, p_reference_date)) AND LAST_DAY(DATEADD(year, 1, p_reference_date), 'year')),
+    'IS_YEAR_PLUS_2', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, 2, p_reference_date)) AND LAST_DAY(DATEADD(year, 2, p_reference_date), 'year')),
+    'IS_YEAR_PLUS_3', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, 3, p_reference_date)) AND LAST_DAY(DATEADD(year, 3, p_reference_date), 'year')),
+    'IS_YEAR_PLUS_4', (p_calendar_date BETWEEN DATE_TRUNC('year', DATEADD(year, 4, p_reference_date)) AND LAST_DAY(DATEADD(year, 4, p_reference_date), 'year'))
+)
+$$;

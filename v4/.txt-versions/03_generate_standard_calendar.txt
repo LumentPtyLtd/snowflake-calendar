@@ -1,5 +1,5 @@
 /*==============================================================================
-  GREGORIAN CALENDAR GENERATOR
+  STANDARD CALENDAR GENERATOR
 
   This script creates a comprehensive standard Gregorian calendar view that enriches
   the date spine with a wide range of date attributes and calculations. It serves
@@ -31,8 +31,8 @@
   Requires the DATE_SPINE_{TIME_GRAIN} table to exist
 
   AUTHOR: Andrew Exley, Lument Pty Ltd
-  DATE CREATED: 2024-04-04
-  LAST MODIFIED: 2024-04-05 (Corrected structure)
+  DATE CREATED: 2025-04-04
+  LAST MODIFIED: 2025-04-05 (Corrected structure)
 ==============================================================================*/
 
 CREATE OR REPLACE PROCEDURE GENERATE_CALENDAR(TIME_GRAIN VARCHAR(10))
@@ -157,12 +157,12 @@ $$
         // *** NOW define createViewSql using the populated variables ***
         createViewSql = `
             CREATE OR REPLACE VIEW ${viewName} (
-                ${columnDefinitions} -- Now correctly populated
+                ${columnDefinitions}
             )
             COMMENT = '${viewComment.replace(/'/g, "''")}'
             AS
             SELECT
-                ${selectExpressions} -- Now correctly populated
+                ${selectExpressions}
             FROM ${baseTableName} ds -- Added alias 'ds' for clarity
             ORDER BY ds.DATE_TIME
         `;

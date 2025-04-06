@@ -1,0 +1,222 @@
+/*==============================================================================
+  MULTI-TIMEZONE DYNAMIC PERIODS GENERATOR (Refactored with UDF + IS_NOW, Param Removed)
+
+  Creates a dynamic periods view with multi-timezone support using
+  UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS for date-based flags and adds
+  timestamp-based IS_..._NOW flags directly for each timezone.
+  The number of relative period flags (+/- N) is fixed within the UDF.
+
+  USAGE:
+  ------
+  -- Ensure UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS exists first
+  CALL GENERATE_DYNAMIC_PERIODS(
+      'DAY',                                   -- Time grain (affects IS_NOW calc and view name)
+      ARRAY_CONSTRUCT('Etc/UTC', 'Europe/London', 'America/New_York') -- Time zones
+  );
+
+  PARAMETERS:
+  -----------
+  TIME_GRAIN: Granularity level (SECOND, MINUTE, HOUR, DAY)
+  TIME_ZONES: Array of time zone names to support
+
+  RETURNS: String indicating success or failure.
+  NOTES: Relies on UDF. Base calendar must contain DATE_KEY and DATE_TIME.
+
+  AUTHOR: Andrew Exley, Lument Pty Ltd
+  DATE CREATED: 2025-04-04
+  LAST MODIFIED: 2025-04-05 (Refactored)
+==============================================================================*/
+CREATE OR REPLACE PROCEDURE GENERATE_DYNAMIC_PERIODS_MTZ(
+    TIME_GRAIN VARCHAR(10),
+    TIME_ZONES ARRAY DEFAULT ARRAY_CONSTRUCT('Etc/UTC')
+    -- Removed RELATIVE_PERIODS_COUNT_ARG parameter
+)
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+AS
+$$
+    // ----- Input Validation -----
+    const validTimeGrains = ['SECOND', 'MINUTE', 'HOUR', 'DAY'];
+    const grainUpper = TIME_GRAIN.toUpperCase();
+    if (validTimeGrains.indexOf(grainUpper) === -1) {
+        return `ERROR: Dynamic Periods generation currently supports grains: ${validTimeGrains.join(', ')}. Grain provided: ${TIME_GRAIN}`;
+    }
+    const baseViewName = "UNIFIED_CALENDAR_TABLE_" + grainUpper; // Assuming unified base
+    if (!TIME_ZONES || TIME_ZONES.length === 0) {
+        return "ERROR: At least one time zone must be specified in TIME_ZONES array.";
+    }
+    // Removed validation and assignment for RELATIVE_PERIODS_COUNT_ARG
+
+    // ----- Dynamic Name Construction -----
+    const dynamicViewName = `DYNAMIC_PERIODS_${grainUpper}`;
+    let viewNameSuffix = '';
+    // (Keep existing view name suffix logic based on TIME_ZONES array)
+    if (TIME_ZONES.length === 1 && TIME_ZONES[0] === 'Etc/UTC') {
+        // Default case, no suffix needed
+    } else if (TIME_ZONES.length <= 3) {
+        const tzCodes = TIME_ZONES.map(tz => {
+            const parts = tz.split('/');
+            const lastPart = parts[parts.length - 1];
+            return lastPart.replace(/[^a-zA-Z0-9_]/g, '_').substring(0, 4).toUpperCase();
+        });
+        viewNameSuffix = `_${tzCodes.join('_')}`;
+    } else {
+        viewNameSuffix = `_${TIME_ZONES.length}TZ`;
+    }
+    const finalViewName = `${dynamicViewName}${viewNameSuffix}`;
+
+    // ----- SQL Construction -----
+    let createViewSql = '';
+    let currentStep = 'Starting';
+
+    try {
+        currentStep = 'Constructing time zone UDF calls and IS_NOW flags';
+
+        // Generate the SELECT list parts for each time zone
+        let tzSelectLists = []; // For UDF-based flags
+        let tzIsNowFlags = [];  // For IS_..._NOW flags
+
+        TIME_ZONES.forEach(tz => {
+            const safeTzName = tz.replace(/[^a-zA-Z0-9_]/g, '_'); // Sanitize for prefix
+            const tzColumnPrefix = `CURRENT_${safeTzName}`;
+            const refDateExpr = `DATE(CONVERT_TIMEZONE('Etc/UTC', '${tz}', CURRENT_TIMESTAMP()))`;
+            const refTimestampExpr = `DATE_TRUNC('${grainUpper}', CONVERT_TIMEZONE('Etc/UTC', '${tz}', CURRENT_TIMESTAMP()))`;
+
+            // 1. Add IS_..._NOW calculation for this timezone
+            tzIsNowFlags.push(`(c.DATE_TIME = ${refTimestampExpr}) AS IS_${tzColumnPrefix}_NOW`);
+
+            // 2. Define UDF call for this timezone
+            const udfCall = `UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS(c.DATE_KEY, ${refDateExpr})`;
+
+            // 3. Extract flags from UDF with prefix
+            const flagKeys = [ // Boolean flags from UDF
+                'IS_TODAY', 'IS_YESTERDAY', 'IS_TOMORROW', 'IS_THIS_WEEK', 'IS_LAST_WEEK', 'IS_NEXT_WEEK',
+                'IS_THIS_MONTH', 'IS_LAST_MONTH', 'IS_NEXT_MONTH', 'IS_THIS_QUARTER', 'IS_LAST_QUARTER', 'IS_NEXT_QUARTER',
+                'IS_THIS_YEAR', 'IS_LAST_YEAR', 'IS_NEXT_YEAR', 'IS_YTD', 'IS_QTD', 'IS_MTD', 'IS_WTD',
+                'IS_LAST_7_DAYS', 'IS_LAST_30_DAYS', 'IS_LAST_90_DAYS', 'IS_LAST_365_DAYS',
+                'IS_WEEK_MINUS_1', 'IS_WEEK_MINUS_2', 'IS_WEEK_MINUS_3', 'IS_WEEK_MINUS_4', 'IS_WEEK_MINUS_5', 'IS_WEEK_MINUS_6', 'IS_WEEK_MINUS_7', 'IS_WEEK_MINUS_8', 'IS_WEEK_MINUS_9', 'IS_WEEK_MINUS_10', 'IS_WEEK_MINUS_11', 'IS_WEEK_MINUS_12',
+                'IS_MONTH_MINUS_1', 'IS_MONTH_MINUS_2', 'IS_MONTH_MINUS_3', 'IS_MONTH_MINUS_4', 'IS_MONTH_MINUS_5', 'IS_MONTH_MINUS_6', 'IS_MONTH_MINUS_7', 'IS_MONTH_MINUS_8', 'IS_MONTH_MINUS_9', 'IS_MONTH_MINUS_10', 'IS_MONTH_MINUS_11', 'IS_MONTH_MINUS_12',
+                'IS_QUARTER_MINUS_1', 'IS_QUARTER_MINUS_2', 'IS_QUARTER_MINUS_3', 'IS_QUARTER_MINUS_4', 'IS_QUARTER_MINUS_5', 'IS_QUARTER_MINUS_6', 'IS_QUARTER_MINUS_7', 'IS_QUARTER_MINUS_8', 'IS_QUARTER_MINUS_9', 'IS_QUARTER_MINUS_10', 'IS_QUARTER_MINUS_11', 'IS_QUARTER_MINUS_12',
+                'IS_YEAR_MINUS_1', 'IS_YEAR_MINUS_2', 'IS_YEAR_MINUS_3', 'IS_YEAR_MINUS_4', 'IS_YEAR_MINUS_5', 'IS_YEAR_MINUS_6', 'IS_YEAR_MINUS_7', 'IS_YEAR_MINUS_8', 'IS_YEAR_MINUS_9', 'IS_YEAR_MINUS_10', 'IS_YEAR_MINUS_11', 'IS_YEAR_MINUS_12',
+                'IS_WEEK_PLUS_1', 'IS_WEEK_PLUS_2', 'IS_WEEK_PLUS_3', 'IS_WEEK_PLUS_4',
+                'IS_MONTH_PLUS_1', 'IS_MONTH_PLUS_2', 'IS_MONTH_PLUS_3', 'IS_MONTH_PLUS_4',
+                'IS_QUARTER_PLUS_1', 'IS_QUARTER_PLUS_2', 'IS_QUARTER_PLUS_3', 'IS_QUARTER_PLUS_4',
+                'IS_YEAR_PLUS_1', 'IS_YEAR_PLUS_2', 'IS_YEAR_PLUS_3', 'IS_YEAR_PLUS_4'
+            ];
+            const distanceKeys = [ // Integer distances from UDF
+                'DAYS_FROM_TODAY', 'WEEKS_FROM_THIS_WEEK', 'MONTHS_FROM_THIS_MONTH',
+                'QUARTERS_FROM_THIS_QUARTER', 'YEARS_FROM_THIS_YEAR'
+            ];
+
+            let selectListForTz = [];
+            flagKeys.forEach(key => {
+                // Construct alias like IS_CURRENT_Etc_UTC_TODAY from IS_TODAY key
+                const alias = `IS_${tzColumnPrefix}_${key.substring(3)}`; // Assumes key starts with IS_
+                selectListForTz.push(`${udfCall}:${key}::BOOLEAN AS ${alias}`);
+            });
+            distanceKeys.forEach(key => {
+                 const alias = `${tzColumnPrefix}_${key}`;
+                 selectListForTz.push(`${udfCall}:${key}::INTEGER AS ${alias}`);
+            });
+
+            tzSelectLists.push(selectListForTz.join(',\n                '));
+        });
+
+        // Common period description logic (based on UTC or primary timezone)
+        const baseTzForDesc = TIME_ZONES.includes('Etc/UTC') ? 'Etc_UTC' : TIME_ZONES[0].replace(/[^a-zA-Z0-9_]/g, '_');
+        const basePrefix = `CURRENT_${baseTzForDesc}`;
+
+        const periodDescriptions = `
+            -- Period descriptions (based on ${baseTzForDesc})
+            CASE
+                WHEN IS_${basePrefix}_TODAY THEN 'Today'
+                WHEN IS_${basePrefix}_YESTERDAY THEN 'Yesterday'
+                WHEN IS_${basePrefix}_TOMORROW THEN 'Tomorrow'
+                WHEN IS_${basePrefix}_THIS_WEEK THEN 'This Week'
+                WHEN IS_${basePrefix}_LAST_WEEK THEN 'Last Week'
+                WHEN IS_${basePrefix}_NEXT_WEEK THEN 'Next Week'
+                WHEN IS_${basePrefix}_THIS_MONTH THEN 'This Month'
+                WHEN IS_${basePrefix}_LAST_MONTH THEN 'Last Month'
+                WHEN IS_${basePrefix}_NEXT_MONTH THEN 'Next Month'
+                WHEN IS_${basePrefix}_THIS_QUARTER THEN 'This Quarter'
+                WHEN IS_${basePrefix}_LAST_QUARTER THEN 'Last Quarter'
+                WHEN IS_${basePrefix}_THIS_YEAR THEN 'This Year'
+                WHEN IS_${basePrefix}_LAST_YEAR THEN 'Last Year'
+                WHEN IS_${basePrefix}_YTD THEN 'Year to Date'
+                WHEN IS_${basePrefix}_QTD THEN 'Quarter to Date'
+                WHEN IS_${basePrefix}_MTD THEN 'Month to Date'
+                WHEN IS_${basePrefix}_WTD THEN 'Week to Date'
+                WHEN IS_${basePrefix}_LAST_7_DAYS THEN 'Last 7 Days'
+                WHEN IS_${basePrefix}_LAST_30_DAYS THEN 'Last 30 Days'
+                WHEN IS_${basePrefix}_LAST_90_DAYS THEN 'Last 90 Days'
+                WHEN IS_${basePrefix}_LAST_365_DAYS THEN 'Last 365 Days'
+                ELSE 'Other Period'
+            END AS CURRENT_PERIOD_DESCRIPTION,
+
+            -- Dynamic month/quarter/year offset descriptions (based on ${baseTzForDesc})
+            CASE
+                WHEN ${basePrefix}_MONTHS_FROM_THIS_MONTH = 0 THEN 'Current Month'
+                WHEN ${basePrefix}_MONTHS_FROM_THIS_MONTH = -1 THEN 'Previous Month'
+                WHEN ${basePrefix}_MONTHS_FROM_THIS_MONTH = 1 THEN 'Next Month'
+                WHEN ${basePrefix}_MONTHS_FROM_THIS_MONTH < 0 THEN ABS(${basePrefix}_MONTHS_FROM_THIS_MONTH) || ' Months Ago'
+                ELSE ${basePrefix}_MONTHS_FROM_THIS_MONTH || ' Months From Now'
+            END AS RELATIVE_MONTH_DESCRIPTION,
+
+            CASE
+                WHEN ${basePrefix}_QUARTERS_FROM_THIS_QUARTER = 0 THEN 'Current Quarter'
+                WHEN ${basePrefix}_QUARTERS_FROM_THIS_QUARTER = -1 THEN 'Previous Quarter'
+                WHEN ${basePrefix}_QUARTERS_FROM_THIS_QUARTER = 1 THEN 'Next Quarter'
+                WHEN ${basePrefix}_QUARTERS_FROM_THIS_QUARTER < 0 THEN ABS(${basePrefix}_QUARTERS_FROM_THIS_QUARTER) || ' Quarters Ago'
+                ELSE ${basePrefix}_QUARTERS_FROM_THIS_QUARTER || ' Quarters From Now'
+            END AS RELATIVE_QUARTER_DESCRIPTION,
+
+            CASE
+                WHEN ${basePrefix}_YEARS_FROM_THIS_YEAR = 0 THEN 'Current Year'
+                WHEN ${basePrefix}_YEARS_FROM_THIS_YEAR = -1 THEN 'Previous Year'
+                WHEN ${basePrefix}_YEARS_FROM_THIS_YEAR = 1 THEN 'Next Year'
+                WHEN ${basePrefix}_YEARS_FROM_THIS_YEAR < 0 THEN ABS(${basePrefix}_YEARS_FROM_THIS_YEAR) || ' Years Ago'
+                ELSE ${basePrefix}_YEARS_FROM_THIS_YEAR || ' Years From Now'
+            END AS RELATIVE_YEAR_DESCRIPTION
+            `;
+
+        // ----- View Creation -----
+        const tzList = TIME_ZONES.join(', ');
+        const viewComment = `Multi-Timezone Dynamic Periods view based on ${grainUpper} grain, supporting: ${tzList}. Uses UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS for date calculations and includes IS_..._NOW flags based on CURRENT_TIMESTAMP() in each timezone. Provides automatically updating time-relative flags.`;
+
+        createViewSql = `
+            CREATE OR REPLACE VIEW ${finalViewName}
+            COMMENT = '${viewComment.replace(/'/g, "''")}'
+            AS
+            SELECT
+                c.*,
+                -- IS_..._NOW flags (Timestamp-based)
+                ${tzIsNowFlags.join(',\n                ')},
+                -- Date-based flags from UDF calls
+                ${tzSelectLists.join(',\n                ')},
+                -- Descriptions
+                ${periodDescriptions}
+            FROM ${baseViewName} c
+        `;
+
+        currentStep = `Executing CREATE VIEW statement for ${finalViewName}`;
+        snowflake.createStatement({ sqlText: createViewSql }).execute();
+
+        return `Multi-Timezone Dynamic Periods view '${finalViewName}' generated successfully based on '${baseViewName}' using UDF and including IS_..._NOW flags, supporting time zones: ${tzList}. Access the view with SELECT * FROM ${finalViewName}.`;
+
+    } catch (err) {
+         // Check if error is due to missing UDF
+        if (err.message.includes("Unknown user-defined function")) {
+             return `ERROR creating view ${finalViewName}: UDF 'UDF_CALCULATE_DYNAMIC_PERIOD_FLAGS' not found. Please ensure the UDF is created before running this procedure. Original error: ${err.code} - ${err.message}`;
+        }
+         // Check if error is due to missing DATE_TIME or DATE_KEY in base table
+        if (err.message.includes("invalid identifier")) {
+             if (err.message.toUpperCase().includes("'DATE_TIME'")) {
+                 return `ERROR creating view ${finalViewName}: Base calendar '${baseViewName}' does not contain the required 'DATE_TIME' column for the IS_..._NOW calculations. Original error: ${err.code} - ${err.message}`;
+             }
+             if (err.message.toUpperCase().includes("'DATE_KEY'")) {
+                 return `ERROR creating view ${finalViewName}: Base calendar '${baseViewName}' does not contain the required 'DATE_KEY' column for the UDF calls. Original error: ${err.code} - ${err.message}`;
+             }
+        }
+        return `ERROR during Multi-Timezone Dynamic Periods generation (Step: ${currentStep}): ${err.code} - ${err.message}\nAttempted SQL (if applicable):\n${createViewSql}`;
+    }
+$$;
